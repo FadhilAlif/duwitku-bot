@@ -1,0 +1,13 @@
+{
+  "name": "duwitku-bot",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@google/genai": "^1.30.0",
+    "@hono/node-server": "^1.13.7",
+    "@supabase/supabase-js": "^2.47.0",
+    "dotenv": "^16.4.7",
+    "hono": "^4.6.14"
+  }
+}
