@@ -58,10 +58,10 @@ Es teh 3000 GoPay
 - Wallet optional, jika tidak diisi akan otomatis terdeteksi oleh AI`;
 
 // --- HELPER: UTILS ---
-function getWIBDate() {
-  const date = new Date();
-  date.setHours(date.getHours() + 7);
-  return date.toISOString();
+function getTransactionDate() {
+  // Konsisten dengan Flutter: DateTime.now().toUtc().toIso8601String()
+  // Tidak perlu manual adjustment WIB, langsung gunakan UTC
+  return new Date().toISOString();
 }
 
 // Timeout wrapper untuk AI calls
@@ -325,6 +325,7 @@ async function predictCategory(description, amount, type, aiCategories) {
 
 // --- WEBHOOK HANDLER ---
 app.post('/webhook', async (c) => {
+  const startTime = Date.now();
   try {
     const payload = await c.req.json();
     if (payload.event !== 'message' || payload.payload.fromMe) return c.text('OK');
@@ -359,7 +360,7 @@ app.post('/webhook', async (c) => {
     const transactionsToInsert = [];
     // Updated regex to capture optional wallet at the end: [Description] [Amount] [Wallet?]
     const regex = /^(.*?)[\s]+(\d+(?:[.,]\d+)*(?:k|rb|jt|juta)?)(?:[\s]+([a-zA-Z0-9\s]+))?$/i;
-    const wibTimestamp = getWIBDate();
+    const transactionTimestamp = getTransactionDate();
 
     // 🚀 PERFORMANCE: Fetch ALL data ONCE untuk semua transaksi (parallel)
     const [userWallets, defaultWalletId, categoriesIncome, categoriesExpense] = await Promise.all([
@@ -453,7 +454,7 @@ app.post('/webhook', async (c) => {
             amount: amount,
             type: type,
             description: description,
-            transaction_date: wibTimestamp,
+            transaction_date: transactionTimestamp,
             source_type: 'chat_prompt',
             _debug_category_name: categoryName,
             _debug_wallet_name: walletName,
@@ -546,11 +547,18 @@ app.post('/webhook', async (c) => {
       await sendWhatsapp(chatId, MSG_MAIN_MENU);
     }
 
+    const endTime = Date.now();
+    const duration = endTime - startTime;
+    console.log(`⏱️ Execution time: ${duration} ms`);
+
     return c.text('OK');
 
   } catch (e) {
     console.error('💥 CRITICAL ERROR:', e);
     await stopTyping(c.req.payload?.chatId || '');
+    const endTime = Date.now();
+    const duration = endTime - startTime;
+    console.log(`⏱️ Execution time (error): ${duration} ms`);
     return c.text('Error', 500);
   }
 });
