@@ -466,11 +466,65 @@ app.post('/webhook', async (c) => {
     if (transactionsToInsert.length > 0) {
       const cleanData = transactionsToInsert.map(({ _debug_category_name, _debug_wallet_name, _debug_wallet_source, ...keep }) => keep);
       
-      // 🚀 PERFORMANCE: Parallel DB insert + stop typing
-      const [dbResult] = await Promise.allSettled([
-        supabase.from('transactions').insert(cleanData),
-        stopTyping(chatId)
+      // STEP 1: Calculate wallet balance changes (group by wallet_id)
+      const walletChanges = {};
+      transactionsToInsert.forEach(t => {
+        const change = t.type === 'income' ? t.amount : -t.amount;
+        walletChanges[t.wallet_id] = (walletChanges[t.wallet_id] || 0) + change;
+      });
+
+      // STEP 2: Update all affected wallet balances
+      const walletUpdatePromises = Object.entries(walletChanges).map(async ([walletId, change]) => {
+        try {
+          // Fetch current balance
+          const { data: wallet, error: fetchError } = await supabase
+            .from('wallets')
+            .select('initial_balance')
+            .eq('id', walletId)
+            .single();
+
+          if (fetchError || !wallet) {
+            console.error(`❌ Failed to fetch wallet ${walletId}:`, fetchError);
+            return false;
+          }
+
+          const currentBalance = parseFloat(wallet.initial_balance) || 0;
+          const newBalance = currentBalance + change;
+
+          // Update balance
+          const { error: updateError } = await supabase
+            .from('wallets')
+            .update({ initial_balance: newBalance })
+            .eq('id', walletId);
+
+          if (updateError) {
+            console.error(`❌ Failed to update wallet ${walletId}:`, updateError);
+            return false;
+          }
+
+          console.log(`Wallet ${walletId}: ${currentBalance} → ${newBalance} (${change >= 0 ? '+' : ''}${change})`);
+          return true;
+        } catch (e) {
+          console.error(`❌ Error updating wallet ${walletId}:`, e.message);
+          return false;
+        }
+      });
+
+      // PERFORMANCE: Parallel wallet updates + transaction insert + stop typing
+      const [walletResults, dbResult] = await Promise.allSettled([
+        Promise.all(walletUpdatePromises),
+        supabase.from('transactions').insert(cleanData).then(res => {
+          stopTyping(chatId);
+          return res;
+        })
       ]);
+
+      // Check wallet update results
+      const walletUpdateSuccess = walletResults.status === 'fulfilled' && walletResults.value.every(r => r === true);
+      
+      if (!walletUpdateSuccess) {
+        console.warn('⚠️ Some wallet updates failed, but transactions were still inserted');
+      }
 
       const error = dbResult.status === 'fulfilled' ? dbResult.value.error : dbResult.reason;
 
@@ -478,7 +532,7 @@ app.post('/webhook', async (c) => {
         console.error('❌ GAGAL INSERT DB:', error);
         await sendWhatsapp(chatId, `⚠️ Gagal menyimpan: ${error.message || error}`);
       } else {
-        let reply = `✅ *Tersimpan (${transactionsToInsert.length})*\n`;
+        let reply = `✅ *Transaksi tersimpan (${transactionsToInsert.length})*\n`;
         transactionsToInsert.forEach(t => {
           const icon = t.type === 'income' ? '📈' : '📉';
           const walletIcon = t._debug_wallet_source === 'manual' ? '✏️' : '🤖';
