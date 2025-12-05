@@ -28,8 +28,8 @@ Saya *Duwitku BOT*🤖, asisten keuangan pribadi kamu 😊
 Pilih opsi yang kamu butuhkan dengan mengetik angka:
 
 1️⃣ Cara Mencatat di Duwitku
-2️⃣ Laporan Keuangan Hari Ini (Coming Soon)
-3️⃣ Laporan Keuangan Bulan Ini (Coming Soon)
+2️⃣ Laporan Keuangan Hari Ini
+3️⃣ Laporan Keuangan Bulan Ini
 4️⃣ Download Aplikasi Duwitku (Coming Soon)
 5️⃣ Lapor Kendala (Coming Soon)
 
@@ -121,12 +121,28 @@ async function sendWhatsapp(chatId, text) {
 // --- HELPER: DATABASE ---
 async function getUserIdByPhone(phoneRaw) {
   const phoneNumber = phoneRaw.split('@')[0];
+  
+  console.log(`🔍 Looking up user with phone: ${phoneNumber} (from: ${phoneRaw})`);
+  
   const { data, error } = await supabase
     .from('profiles')
-    .select('id')
+    .select('id, phone_number')
     .eq('phone_number', phoneNumber)
     .single();
-  if (error || !data) return null;
+  
+  if (error) {
+    console.log(`⚠️ Database error: ${error.message}`);
+    console.log(`⚠️ Error code: ${error.code}`);
+    return null;
+  }
+  
+  if (!data) {
+    console.log(`❌ No user found with phone_number: ${phoneNumber}`);
+    console.log(`💡 Please check Supabase profiles table for this exact phone number`);
+    return null;
+  }
+  
+  console.log(`✅ User found! ID: ${data.id}, Phone in DB: ${data.phone_number}`);
   return data.id;
 }
 
@@ -184,6 +200,157 @@ async function getUserWallets(userId) {
     console.error('❌ getUserWallets Error:', e.message);
     return [];
   }
+}
+
+// --- HELPER: REPORTS ---
+async function getDailyReport(userId) {
+  try {
+    // Get today's date range in UTC
+    const today = new Date();
+    const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0).toISOString();
+    const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).toISOString();
+
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select(`
+        id,
+        amount,
+        type,
+        description,
+        transaction_date,
+        categories:category_id (name),
+        wallets:wallet_id (name)
+      `)
+      .eq('user_id', userId)
+      .gte('transaction_date', startOfDay)
+      .lte('transaction_date', endOfDay)
+      .order('transaction_date', { ascending: false });
+
+    if (error) {
+      console.error('❌ getDailyReport Error:', error);
+      return null;
+    }
+
+    return transactions || [];
+  } catch (e) {
+    console.error('❌ getDailyReport Error:', e.message);
+    return null;
+  }
+}
+
+async function getMonthlyReport(userId) {
+  try {
+    // Get current month's date range
+    const today = new Date();
+    const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1, 0, 0, 0, 0).toISOString();
+    const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0, 23, 59, 59, 999).toISOString();
+
+    const { data: transactions, error } = await supabase
+      .from('transactions')
+      .select(`
+        id,
+        amount,
+        type,
+        description,
+        transaction_date,
+        categories:category_id (name),
+        wallets:wallet_id (name)
+      `)
+      .eq('user_id', userId)
+      .gte('transaction_date', startOfMonth)
+      .lte('transaction_date', endOfMonth)
+      .order('transaction_date', { ascending: false });
+
+    if (error) {
+      console.error('❌ getMonthlyReport Error:', error);
+      return null;
+    }
+
+    return transactions || [];
+  } catch (e) {
+    console.error('❌ getMonthlyReport Error:', e.message);
+    return null;
+  }
+}
+
+function formatReportMessage(transactions, period) {
+  if (!transactions || transactions.length === 0) {
+    return `📊 *Laporan Keuangan ${period}*\n\n` +
+           `Belum ada transaksi ${period.toLowerCase()}.\n\n` +
+           `💡 Mulai catat pengeluaranmu dengan mengetik:\n` +
+           `*Makan siang 25000*`;
+  }
+
+  let totalIncome = 0;
+  let totalExpense = 0;
+  const expenseByCategory = {};
+  const incomeByCategory = {};
+
+  transactions.forEach(t => {
+    const amount = parseFloat(t.amount) || 0;
+    const categoryName = t.categories?.name || 'Lainnya';
+
+    if (t.type === 'income') {
+      totalIncome += amount;
+      incomeByCategory[categoryName] = (incomeByCategory[categoryName] || 0) + amount;
+    } else {
+      totalExpense += amount;
+      expenseByCategory[categoryName] = (expenseByCategory[categoryName] || 0) + amount;
+    }
+  });
+
+  const balance = totalIncome - totalExpense;
+  const balanceIcon = balance >= 0 ? '💰' : '⚠️';
+
+  let message = `📊 *Laporan Keuangan ${period}*\n\n`;
+  
+  // Summary
+  message += `📈 *Pemasukan:* Rp ${formatRupiah(totalIncome)}\n`;
+  message += `📉 *Pengeluaran:* Rp ${formatRupiah(totalExpense)}\n`;
+  message += `${balanceIcon} *Saldo:* Rp ${formatRupiah(balance)}\n`;
+  message += `📝 *Total Transaksi:* ${transactions.length}\n\n`;
+
+  // Expense breakdown by category
+  if (Object.keys(expenseByCategory).length > 0) {
+    message += `💸 *Pengeluaran per Kategori:*\n`;
+    const sortedExpenses = Object.entries(expenseByCategory)
+      .sort((a, b) => b[1] - a[1]);
+    
+    sortedExpenses.forEach(([category, amount]) => {
+      const percentage = totalExpense > 0 ? ((amount / totalExpense) * 100).toFixed(1) : 0;
+      message += `• ${category}: Rp ${formatRupiah(amount)} (${percentage}%)\n`;
+    });
+    message += '\n';
+  }
+
+  // Income breakdown by category
+  if (Object.keys(incomeByCategory).length > 0) {
+    message += `💵 *Pemasukan per Kategori:*\n`;
+    const sortedIncome = Object.entries(incomeByCategory)
+      .sort((a, b) => b[1] - a[1]);
+    
+    sortedIncome.forEach(([category, amount]) => {
+      message += `• ${category}: Rp ${formatRupiah(amount)}\n`;
+    });
+    message += '\n';
+  }
+
+  // Recent transactions (max 10)
+  const recentCount = Math.min(transactions.length, 10);
+  message += `📋 *${recentCount} Transaksi Terakhir:*\n`;
+  
+  transactions.slice(0, 10).forEach(t => {
+    const icon = t.type === 'income' ? '📈' : '📉';
+    const amount = parseFloat(t.amount) || 0;
+    const walletName = t.wallets?.name || 'Unknown';
+    message += `${icon} ${t.description}: Rp ${formatRupiah(amount)} (${walletName})\n`;
+  });
+
+  if (transactions.length > 10) {
+    message += `\n_...dan ${transactions.length - 10} transaksi lainnya_`;
+  }
+
+  return message;
 }
 
 // --- SMART WALLET AI ---
@@ -336,6 +503,26 @@ app.post('/webhook', async (c) => {
 
     console.log(`\n--- 📩 Pesan Baru dari ${sender} ---`);
     
+    // 🛡️ FILTER: Skip non-personal chats (Channels, Communities, Groups)
+    if (sender.endsWith('@lid')) {
+      console.log(`⚠️ Skipped: WhatsApp Channel/Newsletter (@lid)`);
+      console.log(`ℹ️ Bot hanya mendukung chat pribadi (@c.us)`);
+      return c.text('OK');
+    }
+    
+    if (sender.endsWith('@g.us')) {
+      console.log(`⚠️ Skipped: Group chat (@g.us)`);
+      return c.text('OK');
+    }
+
+    // Debug: Log full payload untuk investigasi
+    if (!sender.endsWith('@c.us') && !sender.endsWith('@s.whatsapp.net')) {
+      console.log(`⚠️ Unknown sender format: ${sender}`);
+      console.log(`📋 Full payload.from: ${JSON.stringify(payload.payload.from)}`);
+      console.log(`📋 Full payload.chatId: ${JSON.stringify(payload.payload.chatId)}`);
+      console.log(`📋 Participant: ${JSON.stringify(payload.payload.participant || 'N/A')}`);
+    }
+    
     const userId = await getUserIdByPhone(sender);
     if (!userId) {
         console.log('User tidak terdaftar');
@@ -350,7 +537,37 @@ app.post('/webhook', async (c) => {
       await stopTyping(chatId);
       await sendWhatsapp(chatId, MSG_HELP);
       return c.text('OK');
-    } else if (['2', '3', '4', '5'].includes(cleanMsg)) {
+    } else if (cleanMsg === '2') {
+      // Laporan Harian
+      console.log('📊 Generating daily report...');
+      const transactions = await getDailyReport(userId);
+      const today = new Date();
+      const dateStr = today.toLocaleDateString('id-ID', { 
+        weekday: 'long', 
+        day: 'numeric', 
+        month: 'long', 
+        year: 'numeric' 
+      });
+      const report = formatReportMessage(transactions, `Hari Ini (${dateStr})`);
+      await stopTyping(chatId);
+      await sendWhatsapp(chatId, report);
+      console.log(`✅ Daily report sent (${transactions?.length || 0} transactions)`);
+      return c.text('OK');
+    } else if (cleanMsg === '3') {
+      // Laporan Bulanan
+      console.log('📊 Generating monthly report...');
+      const transactions = await getMonthlyReport(userId);
+      const today = new Date();
+      const monthStr = today.toLocaleDateString('id-ID', { 
+        month: 'long', 
+        year: 'numeric' 
+      });
+      const report = formatReportMessage(transactions, `Bulan ${monthStr}`);
+      await stopTyping(chatId);
+      await sendWhatsapp(chatId, report);
+      console.log(`✅ Monthly report sent (${transactions?.length || 0} transactions)`);
+      return c.text('OK');
+    } else if (['4', '5'].includes(cleanMsg)) {
       await stopTyping(chatId);
       await sendWhatsapp(chatId, '🚧 Fitur ini sedang dalam pengembangan (Coming Soon)!');
       return c.text('OK');
@@ -536,9 +753,9 @@ app.post('/webhook', async (c) => {
         let reply = `✅ *Transaksi tersimpan (${transactionsToInsert.length})*\n`;
         transactionsToInsert.forEach(t => {
           const icon = t.type === 'income' ? '📈' : '📉';
-          const walletIcon = t._debug_wallet_source === 'manual' ? '✏️' : '🤖';
+          // const walletIcon = t._debug_wallet_source === 'manual' ? '✏️' : '🤖';
           reply += `${icon} *${t.description}*: Rp ${formatRupiah(t.amount)}\n`;
-          reply += `${t._debug_category_name} • ${t._debug_wallet_name}\n ${walletIcon}`;
+          reply += `${t._debug_category_name} • ${t._debug_wallet_name}\n`;
         });
         await sendWhatsapp(chatId, reply);
       }
