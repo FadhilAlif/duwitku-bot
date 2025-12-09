@@ -4,25 +4,57 @@ const { Hono } = require('hono');
 const { createClient } = require('@supabase/supabase-js');
 const { GoogleGenAI } = require('@google/genai');
 
+// =============================================================================
+// CONFIGURATION
+// =============================================================================
+
+const CONFIG = {
+  port: parseInt(process.env.PORT) || 5000,
+  wahaUrl: process.env.WAHA_API_URL || 'http://waha:3000',
+  wahaApiKey: process.env.WHATSAPP_API_KEY,
+  geminiApiKey: process.env.GEMINI_API_KEY,
+  supabaseUrl: process.env.SUPABASE_URL,
+  supabaseKey: process.env.SUPABASE_SERVICE_KEY,
+  
+  // Default category IDs (fallback when AI fails)
+  defaultCategoryIncome: 28,
+  defaultCategoryExpense: 29,
+  
+  // Performance settings
+  aiTimeoutMs: 10000,
+  webhookRetryAttempts: 5,
+  webhookRetryDelayMs: 3000,
+};
+
+// Validate required environment variables
+const requiredEnvVars = ['SUPABASE_URL', 'SUPABASE_SERVICE_KEY', 'WHATSAPP_API_KEY', 'GEMINI_API_KEY'];
+for (const envVar of requiredEnvVars) {
+  if (!process.env[envVar]) {
+    console.error(`❌ Missing required environment variable: ${envVar}`);
+    process.exit(1);
+  }
+}
+
+// =============================================================================
+// INITIALIZE SERVICES
+// =============================================================================
+
 const app = new Hono();
+const supabase = createClient(CONFIG.supabaseUrl, CONFIG.supabaseKey);
+const ai = new GoogleGenAI({ apiKey: CONFIG.geminiApiKey });
 
-// --- KONFIGURASI ---
-const PORT = 5000;
-const WAHA_API_URL = process.env.WAHA_API_URL || 'http://waha:3000';
-const WAHA_API_KEY = process.env.WHATSAPP_API_KEY;
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+// Reusable headers for WAHA API calls
+const WAHA_HEADERS = {
+  'Content-Type': 'application/json',
+  'X-Api-Key': CONFIG.wahaApiKey,
+};
 
-const CATEGORY_ID_INCOME = 28; 
-const CATEGORY_ID_EXPENSE = 29;
+// =============================================================================
+// STATIC MESSAGES
+// =============================================================================
 
-// Performance: Timeout untuk AI calls (prevent hanging)
-const AI_TIMEOUT_MS = 10000; // 10 seconds
-
-const supabase = createClient(process.env.SUPABASE_URL, process.env.SUPABASE_SERVICE_KEY);
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-
-// --- PESAN STATIS ---
-const MSG_MAIN_MENU = `Halo Mas/Mbak! 👋
+const MESSAGES = {
+  mainMenu: `Halo Mas/Mbak! 👋
 Saya *Duwitku BOT*🤖, asisten keuangan pribadi kamu 😊
 
 Pilih opsi yang kamu butuhkan dengan mengetik angka:
@@ -30,13 +62,13 @@ Pilih opsi yang kamu butuhkan dengan mengetik angka:
 1️⃣ Cara Mencatat di Duwitku
 2️⃣ Laporan Keuangan Hari Ini
 3️⃣ Laporan Keuangan Bulan Ini
-4️⃣ Download Aplikasi Duwitku (Coming Soon)
-5️⃣ Lapor Kendala (Coming Soon)
+4️⃣ Download Aplikasi Duwitku
+5️⃣ Lapor Kendala
 
 ✨ *Tips:*
-- Ketik angkanya saja. Contoh: *1* untuk "Cara Mencatat".`;
+- Ketik angkanya saja. Contoh: *1* untuk "Cara Mencatat".`,
 
-const MSG_HELP = `1️⃣ *Cara Mencatat di Duwitku*
+  help: `1️⃣ *Cara Mencatat di Duwitku*
 
 📉 *Untuk Catat Pengeluaran (Expenses):*
 Ketik: [Nama] [Harga] [Wallet]
@@ -55,329 +87,419 @@ Bakso 5000 Cash
 Es teh 3000 GoPay
 
 💡 *Tips:*
-- Wallet optional, jika tidak diisi akan otomatis terdeteksi oleh AI`;
+- Wallet optional, jika tidak diisi akan otomatis terdeteksi oleh AI`,
 
-// --- HELPER: UTILS ---
-function getTransactionDate() {
-  // Konsisten dengan Flutter: DateTime.now().toUtc().toIso8601String()
-  // Tidak perlu manual adjustment WIB, langsung gunakan UTC
-  return new Date().toISOString();
-}
+  download: `📱 *Download Aplikasi Duwitku*
 
-// Timeout wrapper untuk AI calls
-function withTimeout(promise, timeoutMs) {
+Duwitku adalah aplikasi pencatatan keuangan pribadi yang simpel dan cerdas dengan fitur AI categorization.
+
+📥 *Download Android APK (v2.0.0):*
+https://github.com/FadhilAlif/duwitku/releases/download/v2.0.0/Duwitku-v2.apk
+
+📂 *Repository GitHub:*
+https://github.com/FadhilAlif/duwitku
+
+💡 *Tips:* Pastikan izinkan instalasi dari sumber tidak dikenal di pengaturan HP kamu.`,
+
+  reportIssue: `🛠️ *Lapor Kendala*
+
+Mengalami masalah atau punya saran untuk Duwitku? Hubungi developer kami:
+
+📧 *Email:*
+fadhil.alifp@gmail.com
+
+📱 *WhatsApp:*
++6285727304551
+
+💡 *Tips saat melapor:*
+• Jelaskan masalah dengan detail
+• Sertakan screenshot jika memungkinkan
+• Sebutkan versi aplikasi yang digunakan
+
+Kami akan merespons secepat mungkin! 🙏`,
+};
+
+// =============================================================================
+// UTILITY FUNCTIONS
+// =============================================================================
+
+/**
+ * Format number to Indonesian Rupiah format
+ */
+const formatRupiah = (num) => num.toLocaleString('id-ID');
+
+/**
+ * Parse amount string to number (supports k, rb, jt, juta)
+ */
+const parseAmount = (str) => {
+  if (!str) return 0;
+  const val = str.toLowerCase().replace(/rp|\.|,/g, '');
+  if (val.includes('k') || val.includes('rb')) return parseFloat(val) * 1000;
+  if (val.includes('jt') || val.includes('juta')) return parseFloat(val) * 1000000;
+  return parseFloat(val) || 0;
+};
+
+/**
+ * Get current timestamp in ISO format
+ */
+const getTransactionDate = () => new Date().toISOString();
+
+/**
+ * Wrap promise with timeout
+ */
+const withTimeout = (promise, timeoutMs, errorMessage = 'Operation timed out') => {
   return Promise.race([
     promise,
     new Promise((_, reject) => 
-      setTimeout(() => reject(new Error('AI Timeout')), timeoutMs)
-    )
+      setTimeout(() => reject(new Error(errorMessage)), timeoutMs)
+    ),
   ]);
+};
+
+/**
+ * Sleep utility for retry logic
+ */
+const sleep = (ms) => new Promise(resolve => setTimeout(resolve, ms));
+
+/**
+ * Check if sender is a valid personal chat
+ */
+const isPersonalChat = (sender) => {
+  return sender.endsWith('@c.us') || sender.endsWith('@s.whatsapp.net');
+};
+
+/**
+ * Extract phone number from WhatsApp ID
+ */
+const extractPhoneNumber = (sender) => sender.split('@')[0];
+
+// =============================================================================
+// WAHA API FUNCTIONS
+// =============================================================================
+
+/**
+ * Register webhook with WAHA (with retry logic)
+ */
+async function registerWebhook() {
+  const webhookUrl = `http://bot:${CONFIG.port}/webhook`;
+  
+  for (let attempt = 1; attempt <= CONFIG.webhookRetryAttempts; attempt++) {
+    try {
+      console.log(`🔄 Registering webhook (attempt ${attempt}/${CONFIG.webhookRetryAttempts})...`);
+      
+      // Check if WAHA is ready
+      const healthCheck = await fetch(`${CONFIG.wahaUrl}/api/sessions/default`, {
+        headers: WAHA_HEADERS,
+      });
+      
+      if (!healthCheck.ok) {
+        throw new Error(`WAHA not ready: ${healthCheck.status}`);
+      }
+
+      // Update session webhook configuration
+      const response = await fetch(`${CONFIG.wahaUrl}/api/sessions/default`, {
+        method: 'PUT',
+        headers: WAHA_HEADERS,
+        body: JSON.stringify({
+          config: {
+            webhooks: [{
+              url: webhookUrl,
+              events: ['message'],
+            }],
+          },
+        }),
+      });
+
+      if (response.ok) {
+        console.log(`✅ Webhook registered: ${webhookUrl}`);
+        return true;
+      }
+      
+      throw new Error(`Failed to register webhook: ${response.status}`);
+    } catch (error) {
+      console.warn(`⚠️ Webhook registration attempt ${attempt} failed:`, error.message);
+      
+      if (attempt < CONFIG.webhookRetryAttempts) {
+        console.log(`⏳ Retrying in ${CONFIG.webhookRetryDelayMs / 1000}s...`);
+        await sleep(CONFIG.webhookRetryDelayMs);
+      }
+    }
+  }
+  
+  console.error('❌ Failed to register webhook after all attempts');
+  console.log('💡 Please configure webhook manually in WAHA dashboard');
+  return false;
 }
 
-function formatRupiah(num) {
-  return num.toLocaleString('id-ID');
-}
-
-function parseAmount(str) {
-  if (!str) return 0;
-  let val = str.toLowerCase().replace(/rp|\.|,/g, '');
-  if (val.includes('k') || val.includes('rb')) return parseFloat(val) * 1000;
-  if (val.includes('jt') || val.includes('juta')) return parseFloat(val) * 1000000;
-  return parseFloat(val);
-}
-
-// --- HELPER: WAHA ACTIONS ---
-async function startTyping(chatId) {
+/**
+ * Send typing indicator
+ */
+const startTyping = async (chatId) => {
   try {
-    await fetch(`${WAHA_API_URL}/api/startTyping`, {
+    await fetch(`${CONFIG.wahaUrl}/api/startTyping`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
+      headers: WAHA_HEADERS,
       body: JSON.stringify({ session: 'default', chatId }),
     });
-  } catch (err) { /* silent */ }
-}
+  } catch { /* Silent fail */ }
+};
 
-async function stopTyping(chatId) {
+/**
+ * Stop typing indicator
+ */
+const stopTyping = async (chatId) => {
   try {
-    await fetch(`${WAHA_API_URL}/api/stopTyping`, {
+    await fetch(`${CONFIG.wahaUrl}/api/stopTyping`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
+      headers: WAHA_HEADERS,
       body: JSON.stringify({ session: 'default', chatId }),
     });
-  } catch (err) { /* silent */ }
-}
+  } catch { /* Silent fail */ }
+};
 
-async function sendWhatsapp(chatId, text) {
-  console.log(`📤 Mengirim pesan ke ${chatId}...`);
+/**
+ * Send WhatsApp message
+ */
+const sendMessage = async (chatId, text) => {
   try {
-    await fetch(`${WAHA_API_URL}/api/sendText`, {
+    await fetch(`${CONFIG.wahaUrl}/api/sendText`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', 'X-Api-Key': WAHA_API_KEY },
+      headers: WAHA_HEADERS,
       body: JSON.stringify({ session: 'default', chatId, text }),
     });
-  } catch (err) { console.error('Send WA Error:', err.message); }
-}
+    console.log(`📤 Message sent to ${chatId}`);
+  } catch (error) {
+    console.error('❌ Send message error:', error.message);
+  }
+};
 
-// --- HELPER: DATABASE ---
-async function getUserIdByPhone(phoneRaw) {
-  const phoneNumber = phoneRaw.split('@')[0];
-  
-  console.log(`🔍 Looking up user with phone: ${phoneNumber} (from: ${phoneRaw})`);
-  
+// =============================================================================
+// DATABASE FUNCTIONS
+// =============================================================================
+
+/**
+ * Get user ID by phone number
+ */
+const getUserByPhone = async (phoneNumber) => {
   const { data, error } = await supabase
     .from('profiles')
     .select('id, phone_number')
     .eq('phone_number', phoneNumber)
     .single();
-  
+
   if (error) {
-    console.log(`⚠️ Database error: ${error.message}`);
-    console.log(`⚠️ Error code: ${error.code}`);
+    if (error.code !== 'PGRST116') { // Not "no rows returned"
+      console.warn(`⚠️ Database error: ${error.message}`);
+    }
     return null;
   }
   
-  if (!data) {
-    console.log(`❌ No user found with phone_number: ${phoneNumber}`);
-    console.log(`💡 Please check Supabase profiles table for this exact phone number`);
-    return null;
-  }
+  return data;
+};
+
+/**
+ * Get user's wallets
+ */
+const getUserWallets = async (userId) => {
+  const { data } = await supabase
+    .from('wallets')
+    .select('id, name, type')
+    .eq('user_id', userId);
   
-  console.log(`✅ User found! ID: ${data.id}, Phone in DB: ${data.phone_number}`);
-  return data.id;
-}
+  return data || [];
+};
 
-async function getDefaultWalletId(userId) {
-  try {
-    // Cari wallet default user (cash biasanya)
-    const { data: wallets } = await supabase
-      .from('wallets')
-      .select('id, name, type')
-      .eq('user_id', userId)
-      .order('created_at', { ascending: true })
-      .limit(1);
+/**
+ * Get default wallet ID for user
+ */
+const getDefaultWalletId = async (userId) => {
+  const { data: wallets } = await supabase
+    .from('wallets')
+    .select('id, name, type')
+    .eq('user_id', userId)
+    .order('created_at', { ascending: true })
+    .limit(1);
 
-    if (wallets && wallets.length > 0) {
-      console.log(`💳 Default Wallet: ${wallets[0].name} (${wallets[0].type})`);
-      return wallets[0].id;
-    }
+  if (wallets?.length > 0) {
+    console.log(`💳 Default Wallet: ${wallets[0].name} (${wallets[0].type})`);
+    return wallets[0];
+  }
 
-    // Jika tidak ada wallet, create default cash wallet
-    console.log('⚠️ No wallet found, creating default cash wallet...');
-    const { data: newWallet, error } = await supabase
-      .from('wallets')
-      .insert({
-        user_id: userId,
-        name: 'Cash',
-        type: 'cash',
-        balance: 0,
-        currency: 'IDR'
-      })
-      .select()
-      .single();
+  // Create default cash wallet if none exists
+  console.log('⚠️ No wallet found, creating default...');
+  const { data: newWallet, error } = await supabase
+    .from('wallets')
+    .insert({
+      user_id: userId,
+      name: 'Cash',
+      type: 'cash',
+      balance: 0,
+      currency: 'IDR',
+    })
+    .select()
+    .single();
 
-    if (error || !newWallet) {
-      console.error('❌ Failed to create default wallet:', error);
-      return null;
-    }
-
-    console.log(`✅ Created default wallet: ${newWallet.name}`);
-    return newWallet.id;
-  } catch (e) {
-    console.error('❌ getDefaultWalletId Error:', e.message);
+  if (error) {
+    console.error('❌ Failed to create wallet:', error);
     return null;
   }
-}
 
-async function getUserWallets(userId) {
-  try {
-    const { data: wallets } = await supabase
-      .from('wallets')
-      .select('id, name, type')
-      .eq('user_id', userId);
+  console.log(`✅ Created default wallet: ${newWallet.name}`);
+  return newWallet;
+};
 
-    return wallets || [];
-  } catch (e) {
-    console.error('❌ getUserWallets Error:', e.message);
+/**
+ * Get user's categories
+ */
+const getUserCategories = async (userId, type) => {
+  const { data } = await supabase
+    .from('categories')
+    .select('id, name')
+    .eq('type', type)
+    .or(`is_default.eq.true,user_id.eq.${userId}`);
+
+  return data?.filter(c => c.name !== 'Duwitku Bot') || [];
+};
+
+/**
+ * Get transactions for report
+ */
+const getTransactions = async (userId, startDate, endDate) => {
+  const { data, error } = await supabase
+    .from('transactions')
+    .select(`
+      id, amount, type, description, transaction_date,
+      categories:category_id (name),
+      wallets:wallet_id (name)
+    `)
+    .eq('user_id', userId)
+    .gte('transaction_date', startDate)
+    .lte('transaction_date', endDate)
+    .order('transaction_date', { ascending: false });
+
+  if (error) {
+    console.error('❌ Get transactions error:', error);
     return [];
   }
-}
 
-// --- HELPER: REPORTS ---
-async function getDailyReport(userId) {
-  try {
-    // Get today's date range in UTC
-    const today = new Date();
-    const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 0, 0, 0, 0).toISOString();
-    const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).toISOString();
+  return data || [];
+};
 
-    const { data: transactions, error } = await supabase
-      .from('transactions')
-      .select(`
-        id,
-        amount,
-        type,
-        description,
-        transaction_date,
-        categories:category_id (name),
-        wallets:wallet_id (name)
-      `)
-      .eq('user_id', userId)
-      .gte('transaction_date', startOfDay)
-      .lte('transaction_date', endOfDay)
-      .order('transaction_date', { ascending: false });
-
-    if (error) {
-      console.error('❌ getDailyReport Error:', error);
-      return null;
-    }
-
-    return transactions || [];
-  } catch (e) {
-    console.error('❌ getDailyReport Error:', e.message);
-    return null;
-  }
-}
-
-async function getMonthlyReport(userId) {
-  try {
-    // Get current month's date range
-    const today = new Date();
-    const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1, 0, 0, 0, 0).toISOString();
-    const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0, 23, 59, 59, 999).toISOString();
-
-    const { data: transactions, error } = await supabase
-      .from('transactions')
-      .select(`
-        id,
-        amount,
-        type,
-        description,
-        transaction_date,
-        categories:category_id (name),
-        wallets:wallet_id (name)
-      `)
-      .eq('user_id', userId)
-      .gte('transaction_date', startOfMonth)
-      .lte('transaction_date', endOfMonth)
-      .order('transaction_date', { ascending: false });
-
-    if (error) {
-      console.error('❌ getMonthlyReport Error:', error);
-      return null;
-    }
-
-    return transactions || [];
-  } catch (e) {
-    console.error('❌ getMonthlyReport Error:', e.message);
-    return null;
-  }
-}
-
-function formatReportMessage(transactions, period) {
-  if (!transactions || transactions.length === 0) {
-    return `📊 *Laporan Keuangan ${period}*\n\n` +
-           `Belum ada transaksi ${period.toLowerCase()}.\n\n` +
-           `💡 Mulai catat pengeluaranmu dengan mengetik:\n` +
-           `*Makan siang 25000*`;
-  }
-
-  let totalIncome = 0;
-  let totalExpense = 0;
-  const expenseByCategory = {};
-  const incomeByCategory = {};
-
+/**
+ * Insert transactions and update wallet balances
+ */
+const saveTransactions = async (transactions) => {
+  // Calculate wallet balance changes
+  const walletChanges = {};
   transactions.forEach(t => {
-    const amount = parseFloat(t.amount) || 0;
-    const categoryName = t.categories?.name || 'Lainnya';
+    const change = t.type === 'income' ? t.amount : -t.amount;
+    walletChanges[t.wallet_id] = (walletChanges[t.wallet_id] || 0) + change;
+  });
 
-    if (t.type === 'income') {
-      totalIncome += amount;
-      incomeByCategory[categoryName] = (incomeByCategory[categoryName] || 0) + amount;
-    } else {
-      totalExpense += amount;
-      expenseByCategory[categoryName] = (expenseByCategory[categoryName] || 0) + amount;
+  // Update wallet balances
+  const updatePromises = Object.entries(walletChanges).map(async ([walletId, change]) => {
+    const { data: wallet } = await supabase
+      .from('wallets')
+      .select('initial_balance')
+      .eq('id', walletId)
+      .single();
+
+    if (!wallet) return false;
+
+    const newBalance = (parseFloat(wallet.initial_balance) || 0) + change;
+    const { error } = await supabase
+      .from('wallets')
+      .update({ initial_balance: newBalance })
+      .eq('id', walletId);
+
+    if (!error) {
+      console.log(`Wallet ${walletId}: ${wallet.initial_balance} → ${newBalance}`);
     }
+    return !error;
   });
 
-  const balance = totalIncome - totalExpense;
-  const balanceIcon = balance >= 0 ? '💰' : '⚠️';
+  // Clean debug fields before insert
+  const cleanData = transactions.map(({ _categoryName, _walletName, ...keep }) => keep);
 
-  let message = `📊 *Laporan Keuangan ${period}*\n\n`;
-  
-  // Summary
-  message += `📈 *Pemasukan:* Rp ${formatRupiah(totalIncome)}\n`;
-  message += `📉 *Pengeluaran:* Rp ${formatRupiah(totalExpense)}\n`;
-  message += `${balanceIcon} *Saldo:* Rp ${formatRupiah(balance)}\n`;
-  message += `📝 *Total Transaksi:* ${transactions.length}\n\n`;
+  // Execute in parallel
+  const [walletResults, { error: insertError }] = await Promise.all([
+    Promise.all(updatePromises),
+    supabase.from('transactions').insert(cleanData),
+  ]);
 
-  // Expense breakdown by category
-  if (Object.keys(expenseByCategory).length > 0) {
-    message += `💸 *Pengeluaran per Kategori:*\n`;
-    const sortedExpenses = Object.entries(expenseByCategory)
-      .sort((a, b) => b[1] - a[1]);
+  return {
+    success: !insertError,
+    walletUpdates: walletResults.filter(Boolean).length,
+    error: insertError,
+  };
+};
+
+// =============================================================================
+// AI FUNCTIONS
+// =============================================================================
+
+/**
+ * Predict category using AI
+ */
+const predictCategory = async (description, amount, type, categories) => {
+  if (!categories.length) return null;
+
+  const categoryList = categories.map(c => `${c.id}:${c.name}`).join(', ');
+  const prompt = `You are a financial categorization engine.
+Input: "${description}" (Amount: ${amount}, Type: ${type}).
+Available Categories (ID:Name): ${categoryList}.
+Task: Select the most appropriate Category ID.
+Return ONLY JSON: {"categoryId": <number>}`;
+
+  try {
+    const result = await withTimeout(
+      ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [{ role: 'user', parts: [{ text: prompt }] }],
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: {
+            type: 'OBJECT',
+            properties: { categoryId: { type: 'INTEGER' } },
+            required: ['categoryId'],
+          },
+        },
+      }),
+      CONFIG.aiTimeoutMs,
+      'AI Timeout'
+    );
+
+    const { categoryId } = JSON.parse(result.text);
+    const match = categories.find(c => c.id === categoryId);
     
-    sortedExpenses.forEach(([category, amount]) => {
-      const percentage = totalExpense > 0 ? ((amount / totalExpense) * 100).toFixed(1) : 0;
-      message += `• ${category}: Rp ${formatRupiah(amount)} (${percentage}%)\n`;
-    });
-    message += '\n';
-  }
-
-  // Income breakdown by category
-  if (Object.keys(incomeByCategory).length > 0) {
-    message += `💵 *Pemasukan per Kategori:*\n`;
-    const sortedIncome = Object.entries(incomeByCategory)
-      .sort((a, b) => b[1] - a[1]);
-    
-    sortedIncome.forEach(([category, amount]) => {
-      message += `• ${category}: Rp ${formatRupiah(amount)}\n`;
-    });
-    message += '\n';
-  }
-
-  // Recent transactions (max 10)
-  const recentCount = Math.min(transactions.length, 10);
-  message += `📋 *${recentCount} Transaksi Terakhir:*\n`;
-  
-  transactions.slice(0, 10).forEach(t => {
-    const icon = t.type === 'income' ? '📈' : '📉';
-    const amount = parseFloat(t.amount) || 0;
-    const walletName = t.wallets?.name || 'Unknown';
-    message += `${icon} ${t.description}: Rp ${formatRupiah(amount)} (${walletName})\n`;
-  });
-
-  if (transactions.length > 10) {
-    message += `\n_...dan ${transactions.length - 10} transaksi lainnya_`;
-  }
-
-  return message;
-}
-
-// --- SMART WALLET AI ---
-async function predictWallet(description, amount, type, userWallets) {
-  console.log(`💳 AI Predicting Wallet for: "${description}" (${type})...`);
-
-  if (!userWallets || userWallets.length === 0) {
-    console.log('⚠️ No wallets available for prediction');
+    if (match) {
+      console.log(`✅ AI Category: "${match.name}" (ID: ${match.id})`);
+      return match;
+    }
+    return null;
+  } catch (error) {
+    if (error.message?.includes('429')) {
+      console.warn('⚠️ AI Rate Limit (Category)');
+    } else if (error.message !== 'AI Timeout') {
+      console.error(`❌ AI Category Error: ${error.message}`);
+    }
     return null;
   }
+};
 
-  const walletListString = userWallets
-    .map(w => `${w.id}:${w.name} (${w.type})`)
-    .join(', ');
+/**
+ * Predict wallet using AI
+ */
+const predictWallet = async (description, amount, type, wallets) => {
+  if (!wallets?.length) return null;
 
-  const prompt = `
-    You are a payment method detection engine.
-    Input: "${description}" (Amount: ${amount}, Type: ${type}).
-    Available Wallets (ID:Name (Type)): ${walletListString}.
-    Task: Infer which wallet/payment method was likely used for this transaction based on:
-    - Keywords in description (e.g., "Mandiri", "GoPay", "Cash", "Debit", "Credit")
-    - Transaction context (online shopping might use e-wallet or credit card)
-    - Amount (small amounts often cash, large amounts might be bank transfer)
-    
-    If uncertain, select the most generic wallet (usually "Cash" or the first available).
-    Return ONLY JSON: {"walletId": "<wallet_id as string>"}
-  `;
+  const walletList = wallets.map(w => `${w.id}:${w.name} (${w.type})`).join(', ');
+  const prompt = `You are a payment method detection engine.
+Input: "${description}" (Amount: ${amount}, Type: ${type}).
+Available Wallets (ID:Name (Type)): ${walletList}.
+Task: Infer which wallet was likely used based on keywords and context.
+If uncertain, select "Cash" or the first available.
+Return ONLY JSON: {"walletId": "<wallet_id>"}`;
 
   try {
     const result = await withTimeout(
@@ -389,397 +511,387 @@ async function predictWallet(description, amount, type, userWallets) {
           responseSchema: {
             type: 'OBJECT',
             properties: { walletId: { type: 'STRING' } },
-            required: ['walletId']
-          }
-        }
+            required: ['walletId'],
+          },
+        },
       }),
-      AI_TIMEOUT_MS
+      CONFIG.aiTimeoutMs,
+      'AI Timeout'
     );
 
-    const resultJSON = JSON.parse(result.text);
-    const predictedId = resultJSON.walletId;
+    const { walletId } = JSON.parse(result.text);
+    const match = wallets.find(w => w.id === walletId);
     
-    const exists = userWallets.find(w => w.id === predictedId);
-    if (exists) {
-      console.log(`✅ AI Wallet Match: "${exists.name}" (${exists.type})`);
-      return { id: exists.id, name: exists.name, type: exists.type };
+    if (match) {
+      console.log(`✅ AI Wallet: "${match.name}" (${match.type})`);
+      return match;
     }
-    
-    console.log('⚠️ AI predicted invalid wallet, will use default');
     return null;
-
-  } catch (e) {
-    if (e.message?.includes('429') || e.status === 429) {
-      console.warn('⚠️ AI Rate Limit (Wallet). Using default.');
-      return null;
+  } catch (error) {
+    if (error.message?.includes('429')) {
+      console.warn('⚠️ AI Rate Limit (Wallet)');
+    } else if (error.message !== 'AI Timeout') {
+      console.error(`❌ AI Wallet Error: ${error.message}`);
     }
-    if (e.message === 'AI Timeout') {
-      console.warn('⏱️ AI Wallet Timeout. Using default.');
-      return null;
-    }
-    
-    console.error(`❌ AI Wallet Error: ${e.message}`);
     return null;
   }
-}
+};
 
-// --- SMART CATEGORY AI (STABLE) ---
-async function predictCategory(description, amount, type, aiCategories) {
-  console.log(`🤖 AI Predicting: "${description}" (${type})...`);
+// =============================================================================
+// REPORT FUNCTIONS
+// =============================================================================
 
-  if (aiCategories.length === 0) return null;
+/**
+ * Get daily report data
+ */
+const getDailyReport = async (userId) => {
+  const today = new Date();
+  const startOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate()).toISOString();
+  const endOfDay = new Date(today.getFullYear(), today.getMonth(), today.getDate(), 23, 59, 59, 999).toISOString();
+  return getTransactions(userId, startOfDay, endOfDay);
+};
 
-  const categoryListString = aiCategories.map(c => `${c.id}:${c.name}`).join(', ');
+/**
+ * Get monthly report data
+ */
+const getMonthlyReport = async (userId) => {
+  const today = new Date();
+  const startOfMonth = new Date(today.getFullYear(), today.getMonth(), 1).toISOString();
+  const endOfMonth = new Date(today.getFullYear(), today.getMonth() + 1, 0, 23, 59, 59, 999).toISOString();
+  return getTransactions(userId, startOfMonth, endOfMonth);
+};
 
-  const prompt = `
-    You are a financial categorization engine. 
-    Input: "${description}" (Amount: ${amount}, Type: ${type}).
-    Available Categories (ID:Name): ${categoryListString}.
-    Task: Select the single most appropriate Category ID.
-    Return ONLY JSON: {"categoryId": <number>}
-  `;
-  try {
-    const result = await withTimeout(
-      ai.models.generateContent({
-        model: 'gemini-2.5-flash', 
-        contents: [{ role: 'user', parts: [{ text: prompt }] }],
-        config: {
-          responseMimeType: 'application/json',
-          responseSchema: {
-            type: 'OBJECT',
-            properties: { categoryId: { type: 'INTEGER' } },
-            required: ['categoryId']
-          }
-        }
-      }),
-      AI_TIMEOUT_MS
-    );
-
-    const resultJSON = JSON.parse(result.text);
-    const predictedId = resultJSON.categoryId;
-    
-    const exists = aiCategories.find(c => c.id === predictedId);
-    if (exists) {
-      console.log(`✅ AI Match: "${exists.name}" (ID: ${exists.id})`);
-      return { id: exists.id, name: exists.name };
-    }
-    return null;
-
-  } catch (e) {
-    // Logika Penanganan Error (Rate Limit)
-    if (e.message?.includes('429') || e.status === 429) {
-      console.warn('⚠️ AI Rate Limit (Category). Skip AI, pakai Default.');
-      return null; // Langsung return null agar transaksi tetap tersimpan (Fallback)
-    }
-    
-    if (e.message === 'AI Timeout') {
-      console.warn('⏱️ AI Category Timeout. Using default.');
-      return null;
-    }
-    
-    // Coba Fallback ke Model 2.0 jika 2.5 gagal/not found
-    if (e.message?.includes('404') || e.status === 404) {
-       console.warn('⚠️ Model gemini-2.5-flash not found, using fallback...');
-       try {
-         // ... (Kode retry ke model lain bisa disini, tapi demi kecepatan kita skip dulu)
-       } catch (err2) {}
-    }
-
-    console.error(`❌ AI Category Error: ${e.message}`);
-    return null;
+/**
+ * Format report message
+ */
+const formatReport = (transactions, period) => {
+  if (!transactions?.length) {
+    return `📊 *Laporan Keuangan ${period}*\n\n` +
+           `Belum ada transaksi.\n\n` +
+           `💡 Mulai catat dengan: *Makan siang 25000*`;
   }
-}
 
-// --- WEBHOOK HANDLER ---
+  let totalIncome = 0;
+  let totalExpense = 0;
+  const expenseByCategory = {};
+  const incomeByCategory = {};
+
+  transactions.forEach(t => {
+    const amount = parseFloat(t.amount) || 0;
+    const category = t.categories?.name || 'Lainnya';
+
+    if (t.type === 'income') {
+      totalIncome += amount;
+      incomeByCategory[category] = (incomeByCategory[category] || 0) + amount;
+    } else {
+      totalExpense += amount;
+      expenseByCategory[category] = (expenseByCategory[category] || 0) + amount;
+    }
+  });
+
+  const balance = totalIncome - totalExpense;
+  let msg = `📊 *Laporan Keuangan ${period}*\n\n`;
+  msg += `📈 *Pemasukan:* Rp ${formatRupiah(totalIncome)}\n`;
+  msg += `📉 *Pengeluaran:* Rp ${formatRupiah(totalExpense)}\n`;
+  msg += `${balance >= 0 ? '💰' : '⚠️'} *Saldo:* Rp ${formatRupiah(balance)}\n`;
+  msg += `📝 *Total Transaksi:* ${transactions.length}\n\n`;
+
+  // Expense breakdown
+  if (Object.keys(expenseByCategory).length) {
+    msg += `💸 *Pengeluaran per Kategori:*\n`;
+    Object.entries(expenseByCategory)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([cat, amt]) => {
+        const pct = ((amt / totalExpense) * 100).toFixed(1);
+        msg += `• ${cat}: Rp ${formatRupiah(amt)} (${pct}%)\n`;
+      });
+    msg += '\n';
+  }
+
+  // Income breakdown
+  if (Object.keys(incomeByCategory).length) {
+    msg += `💵 *Pemasukan per Kategori:*\n`;
+    Object.entries(incomeByCategory)
+      .sort((a, b) => b[1] - a[1])
+      .forEach(([cat, amt]) => {
+        msg += `• ${cat}: Rp ${formatRupiah(amt)}\n`;
+      });
+    msg += '\n';
+  }
+
+  // Recent transactions
+  const recentCount = Math.min(transactions.length, 10);
+  msg += `📋 *${recentCount} Transaksi Terakhir:*\n`;
+  transactions.slice(0, 10).forEach(t => {
+    const icon = t.type === 'income' ? '📈' : '📉';
+    const wallet = t.wallets?.name || 'Unknown';
+    msg += `${icon} ${t.description}: Rp ${formatRupiah(parseFloat(t.amount))} (${wallet})\n`;
+  });
+
+  if (transactions.length > 10) {
+    msg += `\n_...dan ${transactions.length - 10} transaksi lainnya_`;
+  }
+
+  return msg;
+};
+
+// =============================================================================
+// MESSAGE HANDLERS
+// =============================================================================
+
+const TRANSACTION_REGEX = /^(.*?)[\s]+(\d+(?:[.,]\d+)*(?:k|rb|jt|juta)?)(?:[\s]+([a-zA-Z0-9\s]+))?$/i;
+
+/**
+ * Handle menu commands
+ */
+const handleMenuCommand = async (command, userId, chatId) => {
+  switch (command) {
+    case '1':
+      await sendMessage(chatId, MESSAGES.help);
+      return true;
+
+    case '2': {
+      console.log('📊 Generating daily report...');
+      const transactions = await getDailyReport(userId);
+      const dateStr = new Date().toLocaleDateString('id-ID', {
+        weekday: 'long', day: 'numeric', month: 'long', year: 'numeric',
+      });
+      await sendMessage(chatId, formatReport(transactions, `Hari Ini (${dateStr})`));
+      console.log(`✅ Daily report sent (${transactions.length} transactions)`);
+      return true;
+    }
+
+    case '3': {
+      console.log('📊 Generating monthly report...');
+      const transactions = await getMonthlyReport(userId);
+      const monthStr = new Date().toLocaleDateString('id-ID', { month: 'long', year: 'numeric' });
+      await sendMessage(chatId, formatReport(transactions, `Bulan ${monthStr}`));
+      console.log(`✅ Monthly report sent (${transactions.length} transactions)`);
+      return true;
+    }
+
+    case '4':
+      await sendMessage(chatId, MESSAGES.download);
+      return true;
+
+    case '5':
+      await sendMessage(chatId, MESSAGES.reportIssue);
+      return true;
+
+    default:
+      return false;
+  }
+};
+
+/**
+ * Parse and process transactions from message
+ */
+const processTransactions = async (message, userId, userWallets, defaultWallet, categories) => {
+  const lines = message.split('\n');
+  const transactions = [];
+  const timestamp = getTransactionDate();
+
+  for (const line of lines) {
+    const cleanLine = line.trim();
+    if (!cleanLine) continue;
+
+    // Determine transaction type
+    const isIncome = cleanLine.toLowerCase().startsWith('duwitku ');
+    const content = isIncome ? cleanLine.substring(8).trim() : cleanLine;
+    const type = isIncome ? 'income' : 'expense';
+
+    const match = content.match(TRANSACTION_REGEX);
+    if (!match) continue;
+
+    const description = match[1].trim();
+    const amount = parseAmount(match[2]);
+    const walletInput = match[3]?.trim();
+
+    if (amount <= 0) continue;
+
+    // Get relevant categories
+    const relevantCategories = categories[type] || [];
+
+    // Parallel AI predictions
+    const [categoryResult, walletResult] = await Promise.allSettled([
+      predictCategory(description, amount, type, relevantCategories),
+      walletInput ? null : predictWallet(description, amount, type, userWallets),
+    ]);
+
+    // Determine category
+    const category = categoryResult.status === 'fulfilled' && categoryResult.value
+      ? categoryResult.value
+      : { id: type === 'income' ? CONFIG.defaultCategoryIncome : CONFIG.defaultCategoryExpense, name: 'Duwitku Bot' };
+
+    // Determine wallet
+    let wallet = defaultWallet;
+    let walletName = defaultWallet.name;
+
+    if (walletInput) {
+      const manualWallet = userWallets.find(w =>
+        w.name.toLowerCase() === walletInput.toLowerCase() ||
+        w.name.toLowerCase().includes(walletInput.toLowerCase())
+      );
+      if (manualWallet) {
+        wallet = manualWallet;
+        walletName = manualWallet.name;
+        console.log(`💳 Manual Wallet: "${walletName}"`);
+      }
+    } else if (walletResult.status === 'fulfilled' && walletResult.value) {
+      wallet = walletResult.value;
+      walletName = wallet.name;
+    }
+
+    transactions.push({
+      user_id: userId,
+      category_id: category.id,
+      wallet_id: wallet.id,
+      amount,
+      type,
+      description,
+      transaction_date: timestamp,
+      source_type: 'chat_prompt',
+      _categoryName: category.name,
+      _walletName: walletName,
+    });
+  }
+
+  return transactions;
+};
+
+// =============================================================================
+// WEBHOOK HANDLER
+// =============================================================================
+
 app.post('/webhook', async (c) => {
   const startTime = Date.now();
+  let chatId = '';
+
   try {
     const payload = await c.req.json();
-    if (payload.event !== 'message' || payload.payload.fromMe) return c.text('OK');
+    
+    // Validate webhook event
+    if (payload.event !== 'message' || payload.payload?.fromMe) {
+      return c.text('OK');
+    }
 
     const message = payload.payload.body || '';
     const sender = payload.payload.from;
-    const chatId = payload.payload.chatId || payload.payload.from;
+    chatId = payload.payload.chatId || sender;
 
-    console.log(`\n--- 📩 Pesan Baru dari ${sender} ---`);
-    
-    // 🛡️ FILTER: Skip non-personal chats (Channels, Communities, Groups)
+    console.log(`\n--- 📩 New message from ${sender} ---`);
+
+    // Filter non-personal chats
     if (sender.endsWith('@lid')) {
-      console.log(`⚠️ Skipped: WhatsApp Channel/Newsletter (@lid)`);
-      console.log(`ℹ️ Bot hanya mendukung chat pribadi (@c.us)`);
+      console.log('⚠️ Skipped: WhatsApp Channel (@lid)');
       return c.text('OK');
     }
-    
+
     if (sender.endsWith('@g.us')) {
-      console.log(`⚠️ Skipped: Group chat (@g.us)`);
+      console.log('⚠️ Skipped: Group chat (@g.us)');
       return c.text('OK');
     }
 
-    // Debug: Log full payload untuk investigasi
-    if (!sender.endsWith('@c.us') && !sender.endsWith('@s.whatsapp.net')) {
-      console.log(`⚠️ Unknown sender format: ${sender}`);
-      console.log(`📋 Full payload.from: ${JSON.stringify(payload.payload.from)}`);
-      console.log(`📋 Full payload.chatId: ${JSON.stringify(payload.payload.chatId)}`);
-      console.log(`📋 Participant: ${JSON.stringify(payload.payload.participant || 'N/A')}`);
-    }
-    
-    const userId = await getUserIdByPhone(sender);
-    if (!userId) {
-        console.log('User tidak terdaftar');
-        return c.text('User not found');
+    if (!isPersonalChat(sender)) {
+      console.log(`⚠️ Unknown format: ${sender}`);
+      return c.text('OK');
     }
 
+    // Lookup user
+    const phoneNumber = extractPhoneNumber(sender);
+    console.log(`🔍 Looking up user: ${phoneNumber}`);
+
+    const user = await getUserByPhone(phoneNumber);
+    if (!user) {
+      console.log('❌ User not registered');
+      return c.text('User not found');
+    }
+
+    console.log(`✅ User found: ${user.id}`);
     await startTyping(chatId);
 
     const cleanMsg = message.trim();
 
-    if (cleanMsg === '1') {
+    // Handle menu commands
+    if (await handleMenuCommand(cleanMsg, user.id, chatId)) {
       await stopTyping(chatId);
-      await sendWhatsapp(chatId, MSG_HELP);
-      return c.text('OK');
-    } else if (cleanMsg === '2') {
-      // Laporan Harian
-      console.log('📊 Generating daily report...');
-      const transactions = await getDailyReport(userId);
-      const today = new Date();
-      const dateStr = today.toLocaleDateString('id-ID', { 
-        weekday: 'long', 
-        day: 'numeric', 
-        month: 'long', 
-        year: 'numeric' 
-      });
-      const report = formatReportMessage(transactions, `Hari Ini (${dateStr})`);
-      await stopTyping(chatId);
-      await sendWhatsapp(chatId, report);
-      console.log(`✅ Daily report sent (${transactions?.length || 0} transactions)`);
-      return c.text('OK');
-    } else if (cleanMsg === '3') {
-      // Laporan Bulanan
-      console.log('📊 Generating monthly report...');
-      const transactions = await getMonthlyReport(userId);
-      const today = new Date();
-      const monthStr = today.toLocaleDateString('id-ID', { 
-        month: 'long', 
-        year: 'numeric' 
-      });
-      const report = formatReportMessage(transactions, `Bulan ${monthStr}`);
-      await stopTyping(chatId);
-      await sendWhatsapp(chatId, report);
-      console.log(`✅ Monthly report sent (${transactions?.length || 0} transactions)`);
-      return c.text('OK');
-    } else if (['4', '5'].includes(cleanMsg)) {
-      await stopTyping(chatId);
-      await sendWhatsapp(chatId, '🚧 Fitur ini sedang dalam pengembangan (Coming Soon)!');
+      console.log(`⏱️ Execution time: ${Date.now() - startTime}ms`);
       return c.text('OK');
     }
 
-    const lines = message.split('\n');
-    const transactionsToInsert = [];
-    // Updated regex to capture optional wallet at the end: [Description] [Amount] [Wallet?]
-    const regex = /^(.*?)[\s]+(\d+(?:[.,]\d+)*(?:k|rb|jt|juta)?)(?:[\s]+([a-zA-Z0-9\s]+))?$/i;
-    const transactionTimestamp = getTransactionDate();
-
-    // 🚀 PERFORMANCE: Fetch ALL data ONCE untuk semua transaksi (parallel)
-    const [userWallets, defaultWalletId, categoriesIncome, categoriesExpense] = await Promise.all([
-      getUserWallets(userId),
-      getDefaultWalletId(userId),
-      supabase.from('categories').select('id, name').eq('type', 'income').or(`is_default.eq.true,user_id.eq.${userId}`).then(res => res.data?.filter(c => c.name !== 'Duwitku Bot') || []),
-      supabase.from('categories').select('id, name').eq('type', 'expense').or(`is_default.eq.true,user_id.eq.${userId}`).then(res => res.data?.filter(c => c.name !== 'Duwitku Bot') || [])
+    // Fetch user data in parallel
+    const [userWallets, defaultWallet, incomeCategories, expenseCategories] = await Promise.all([
+      getUserWallets(user.id),
+      getDefaultWalletId(user.id),
+      getUserCategories(user.id, 'income'),
+      getUserCategories(user.id, 'expense'),
     ]);
-    
-    if (!defaultWalletId) {
+
+    if (!defaultWallet) {
       await stopTyping(chatId);
-      await sendWhatsapp(chatId, '⚠️ Tidak dapat menemukan wallet. Silakan buat wallet terlebih dahulu di aplikasi Duwitku.');
-      return c.text('No wallet found');
+      await sendMessage(chatId, '⚠️ Tidak dapat menemukan wallet. Silakan buat wallet di aplikasi Duwitku.');
+      return c.text('No wallet');
     }
 
-    // Cache default wallet name untuk performa
-    const defaultWallet = userWallets.find(w => w.id === defaultWalletId);
-    const defaultWalletName = defaultWallet?.name || 'Default';
+    // Process transactions
+    const transactions = await processTransactions(
+      message,
+      user.id,
+      userWallets,
+      defaultWallet,
+      { income: incomeCategories, expense: expenseCategories }
+    );
 
-    for (const line of lines) {
-      const cleanLine = line.trim();
-      if (!cleanLine) continue;
+    if (transactions.length > 0) {
+      const result = await saveTransactions(transactions);
+      await stopTyping(chatId);
 
-      let type = 'expense';
-      let content = cleanLine;
-
-      if (cleanLine.toLowerCase().startsWith('duwitku ')) {
-        type = 'income';
-        content = cleanLine.substring(8).trim(); 
-      }
-
-      const match = content.match(regex);
-      if (match) {
-        const description = match[1].trim();
-        const amount = parseAmount(match[2]);
-        const walletInput = match[3]?.trim(); // Wallet dari user input (optional)
-
-        if (amount > 0) {
-          let finalCategoryId = type === 'income' ? CATEGORY_ID_INCOME : CATEGORY_ID_EXPENSE;
-          let categoryName = 'Duwitku Bot';
-          let finalWalletId = defaultWalletId;
-          let walletName = defaultWalletName;
-          let walletSource = 'default';
-
-          // Select appropriate categories based on transaction type
-          const relevantCategories = type === 'income' ? categoriesIncome : categoriesExpense;
-
-          // 🚀 PERFORMANCE: Parallel AI calls (Category + Wallet)
-          const aiPredictions = await Promise.allSettled([
-            relevantCategories.length > 0 ? predictCategory(description, amount, type, relevantCategories) : Promise.resolve(null),
-            walletInput ? Promise.resolve(null) : predictWallet(description, amount, type, userWallets)
-          ]);
-
-          // Process Category AI result
-          const categoryPrediction = aiPredictions[0].status === 'fulfilled' ? aiPredictions[0].value : null;
-          if (categoryPrediction) {
-            finalCategoryId = categoryPrediction.id;
-            categoryName = categoryPrediction.name;
-          }
-
-          // Process Wallet selection
-          if (walletInput) {
-            // Priority 1: Manual wallet input
-            const manualWallet = userWallets.find(w => 
-              w.name.toLowerCase() === walletInput.toLowerCase() ||
-              w.name.toLowerCase().includes(walletInput.toLowerCase())
-            );
-            
-            if (manualWallet) {
-              finalWalletId = manualWallet.id;
-              walletName = manualWallet.name;
-              walletSource = 'manual';
-              console.log(`💳 Manual Wallet: "${walletName}" selected by user`);
-            } else {
-              console.log(`⚠️ Wallet "${walletInput}" not found, using default`);
-            }
-          } else {
-            // Priority 2: AI Prediction
-            const walletPrediction = aiPredictions[1].status === 'fulfilled' ? aiPredictions[1].value : null;
-            if (walletPrediction) {
-              finalWalletId = walletPrediction.id;
-              walletName = walletPrediction.name;
-              walletSource = 'ai';
-            }
-          }
-
-          transactionsToInsert.push({
-            user_id: userId,
-            category_id: finalCategoryId,
-            wallet_id: finalWalletId,
-            amount: amount,
-            type: type,
-            description: description,
-            transaction_date: transactionTimestamp,
-            source_type: 'chat_prompt',
-            _debug_category_name: categoryName,
-            _debug_wallet_name: walletName,
-            _debug_wallet_source: walletSource
-          });
-        }
-      }
-    }
-
-    if (transactionsToInsert.length > 0) {
-      const cleanData = transactionsToInsert.map(({ _debug_category_name, _debug_wallet_name, _debug_wallet_source, ...keep }) => keep);
-      
-      // STEP 1: Calculate wallet balance changes (group by wallet_id)
-      const walletChanges = {};
-      transactionsToInsert.forEach(t => {
-        const change = t.type === 'income' ? t.amount : -t.amount;
-        walletChanges[t.wallet_id] = (walletChanges[t.wallet_id] || 0) + change;
-      });
-
-      // STEP 2: Update all affected wallet balances
-      const walletUpdatePromises = Object.entries(walletChanges).map(async ([walletId, change]) => {
-        try {
-          // Fetch current balance
-          const { data: wallet, error: fetchError } = await supabase
-            .from('wallets')
-            .select('initial_balance')
-            .eq('id', walletId)
-            .single();
-
-          if (fetchError || !wallet) {
-            console.error(`❌ Failed to fetch wallet ${walletId}:`, fetchError);
-            return false;
-          }
-
-          const currentBalance = parseFloat(wallet.initial_balance) || 0;
-          const newBalance = currentBalance + change;
-
-          // Update balance
-          const { error: updateError } = await supabase
-            .from('wallets')
-            .update({ initial_balance: newBalance })
-            .eq('id', walletId);
-
-          if (updateError) {
-            console.error(`❌ Failed to update wallet ${walletId}:`, updateError);
-            return false;
-          }
-
-          console.log(`Wallet ${walletId}: ${currentBalance} → ${newBalance} (${change >= 0 ? '+' : ''}${change})`);
-          return true;
-        } catch (e) {
-          console.error(`❌ Error updating wallet ${walletId}:`, e.message);
-          return false;
-        }
-      });
-
-      // PERFORMANCE: Parallel wallet updates + transaction insert + stop typing
-      const [walletResults, dbResult] = await Promise.allSettled([
-        Promise.all(walletUpdatePromises),
-        supabase.from('transactions').insert(cleanData).then(res => {
-          stopTyping(chatId);
-          return res;
-        })
-      ]);
-
-      // Check wallet update results
-      const walletUpdateSuccess = walletResults.status === 'fulfilled' && walletResults.value.every(r => r === true);
-      
-      if (!walletUpdateSuccess) {
-        console.warn('⚠️ Some wallet updates failed, but transactions were still inserted');
-      }
-
-      const error = dbResult.status === 'fulfilled' ? dbResult.value.error : dbResult.reason;
-
-      if (error) {
-        console.error('❌ GAGAL INSERT DB:', error);
-        await sendWhatsapp(chatId, `⚠️ Gagal menyimpan: ${error.message || error}`);
-      } else {
-        let reply = `✅ *Transaksi tersimpan (${transactionsToInsert.length})*\n`;
-        transactionsToInsert.forEach(t => {
+      if (result.success) {
+        let reply = `✅ *Transaksi tersimpan (${transactions.length})*\n`;
+        transactions.forEach(t => {
           const icon = t.type === 'income' ? '📈' : '📉';
-          // const walletIcon = t._debug_wallet_source === 'manual' ? '✏️' : '🤖';
           reply += `${icon} *${t.description}*: Rp ${formatRupiah(t.amount)}\n`;
-          reply += `${t._debug_category_name} • ${t._debug_wallet_name}\n`;
+          reply += `${t._categoryName} • ${t._walletName}\n`;
         });
-        await sendWhatsapp(chatId, reply);
+        await sendMessage(chatId, reply);
+      } else {
+        await sendMessage(chatId, `⚠️ Gagal menyimpan: ${result.error?.message || 'Unknown error'}`);
       }
     } else {
       await stopTyping(chatId);
-      await sendWhatsapp(chatId, MSG_MAIN_MENU);
+      await sendMessage(chatId, MESSAGES.mainMenu);
     }
 
-    const endTime = Date.now();
-    const duration = endTime - startTime;
-    console.log(`⏱️ Execution time: ${duration} ms`);
-
+    console.log(`⏱️ Execution time: ${Date.now() - startTime}ms`);
     return c.text('OK');
 
-  } catch (e) {
-    console.error('💥 CRITICAL ERROR:', e);
-    await stopTyping(c.req.payload?.chatId || '');
-    const endTime = Date.now();
-    const duration = endTime - startTime;
-    console.log(`⏱️ Execution time (error): ${duration} ms`);
+  } catch (error) {
+    console.error('💥 CRITICAL ERROR:', error);
+    await stopTyping(chatId);
+    console.log(`⏱️ Execution time (error): ${Date.now() - startTime}ms`);
     return c.text('Error', 500);
   }
 });
 
-console.log(`🤖 Bot Duwitku AI (Optimized v2.0) running on port ${PORT}`);
-console.log(`⚡ Performance: Parallel AI calls, Smart caching, ${AI_TIMEOUT_MS}ms timeout`);
-serve({ fetch: app.fetch, port: PORT });
+// Health check endpoint
+app.get('/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOString() }));
+
+// =============================================================================
+// SERVER STARTUP
+// =============================================================================
+
+const startServer = async () => {
+  console.log('🤖 Duwitku Bot v2.1 starting...');
+  console.log(`⚡ Performance: AI timeout ${CONFIG.aiTimeoutMs}ms`);
+  
+  // Start HTTP server
+  serve({ fetch: app.fetch, port: CONFIG.port });
+  console.log(`🚀 Server running on port ${CONFIG.port}`);
+  
+  // Register webhook with delay to allow WAHA to fully start
+  setTimeout(async () => {
+    await registerWebhook();
+  }, 5000);
+};
+
+startServer();
