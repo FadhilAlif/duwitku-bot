@@ -1,25 +1,6 @@
 version: '3.0'
 
 services:
-  waha:
-    image: devlikeapro/waha:latest
-    restart: always
-    environment:
-      - WAHA_DASHBOARD_USERNAME=admin
-      - WAHA_DASHBOARD_PASSWORD=admin123
-      - WHATSAPP_SWAGGER_USERNAME=admin
-      - WHATSAPP_SWAGGER_PASSWORD=admin123
-      - WHATSAPP_API_KEY=${WHATSAPP_API_KEY}
-      - WHATSAPP_DEFAULT_ENGINE=WEBJS
-      # - WHATSAPP_WEBHOOK_URL=http://bot:5000/webhook 
-      # - WHATSAPP_WEBHOOK_EVENTS=message 
-    ports:
-      - "3001:3000"
-    volumes:
-      - ./waha-session:/app/sessions
-    depends_on:
-      - bot
-
   bot:
     build: .
     restart: always
@@ -31,3 +12,25 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
     ports:
       - "5000:5000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  waha:
+    image: devlikeapro/waha:latest
+    restart: always
+    environment:
+      - WAHA_DASHBOARD_USERNAME=admin
+      - WAHA_DASHBOARD_PASSWORD=admin123
+      - WHATSAPP_SWAGGER_USERNAME=admin
+      - WHATSAPP_SWAGGER_PASSWORD=admin123
+      - WHATSAPP_API_KEY=${WHATSAPP_API_KEY}
+      - WHATSAPP_DEFAULT_ENGINE=NOWEB
+    ports:
+      - "3001:3000"
+    volumes:
+      - ./waha-session:/app/sessions
+    depends_on:
+      - bot
