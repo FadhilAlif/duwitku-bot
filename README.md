@@ -1,14 +1,15 @@
 # 🤖 Duwitku WhatsApp Bot
 
 Bot WhatsApp cerdas untuk mencatat keuangan pribadi dengan AI-powered categorization. Dibangun dengan [WAHA (WhatsApp HTTP API)](https://waha.devlike.pro/), Hono.js, Supabase, dan Google Gemini AI.
-
 ## ✨ Fitur
 
 - 📝 **Pencatatan Otomatis**: Catat pengeluaran dan pemasukan via WhatsApp
 - 🤖 **AI Kategorisasi**: Gemini AI secara otomatis mengkategorikan transaksi
 - 💬 **Natural Language**: Ketik seperti chat biasa, bot mengerti
 - 📊 **Multi-Entry**: Catat banyak transaksi sekaligus
+- 📈 **Laporan Harian & Bulanan**: Lihat ringkasan keuangan dengan detail per kategori
 - 🔄 **Real-time Sync**: Langsung tersinkronisasi ke database Supabase
+- ⚡ **Performance Optimized**: Timeout handling, retry mechanism, dan webhook auto-registration
 - 🐳 **Docker Ready**: Deploy dengan satu perintah
 
 ## 📋 Prerequisite
@@ -44,6 +45,8 @@ WHATSAPP_API_KEY=your-secure-api-key
 GEMINI_API_KEY=your-gemini-api-key
 ```
 
+**⚠️ Important:** Bot akan validasi semua environment variables saat startup. Jika ada yang kurang, bot akan exit dengan error message yang jelas.
+
 ### 3. Setup Docker Compose
 
 ```bash
@@ -76,17 +79,29 @@ chmod +x rebuild.sh
 3. Buat session baru dengan nama `default`
 4. Scan QR Code dengan WhatsApp Anda
 
-### 6. Konfigurasi Webhook
+### 6. Webhook Auto-Configuration ✨
 
-Di WAHA Dashboard, set webhook:
-- **URL**: `http://bot:5000/webhook`
-- **Events**: `message`
+Bot sekarang **otomatis mendaftarkan webhook** saat startup! Tidak perlu konfigurasi manual.
 
-Atau uncomment baris webhook di `docker-compose.yml` dan restart:
+Bot akan:
+- Otomatis register webhook ke WAHA pada startup
+- Retry hingga 5x jika gagal (dengan delay 3 detik)
+- Log detail status registrasi
 
+**Verifikasi webhook berhasil:**
 ```bash
-docker-compose restart waha
+# Cek logs bot
+docker-compose logs -f bot
+
+# Cari pesan:
+# ✅ Webhook registered successfully
 ```
+
+**Troubleshooting:**
+Jika webhook gagal register otomatis, bisa manual via WAHA Dashboard:
+- Buka: `http://localhost:3001`
+- Set webhook URL: `http://bot:5000/webhook`
+- Events: `message`
 
 ## 📱 Cara Menggunakan Bot
 
@@ -94,10 +109,10 @@ docker-compose restart waha
 Kirim pesan apa saja ke bot untuk menampilkan menu:
 ```
 1️⃣ Cara Mencatat di Duwitku
-2️⃣ Laporan Keuangan Hari Ini (Coming Soon)
-3️⃣ Laporan Keuangan Bulan Ini (Coming Soon)
-4️⃣ Download Aplikasi Duwitku (Coming Soon)
-5️⃣ Lapor Kendala (Coming Soon)
+2️⃣ Laporan Keuangan Hari Ini
+3️⃣ Laporan Keuangan Bulan Ini
+4️⃣ Download Aplikasi Duwitku
+5️⃣ Lapor Kendala
 ```
 
 ### Catat Pengeluaran
@@ -120,6 +135,18 @@ Es teh 5000
 Parkir 2000
 ```
 
+### Lihat Laporan Keuangan
+```
+2   # Laporan hari ini
+3   # Laporan bulan ini
+```
+
+Laporan akan menampilkan:
+- Total pemasukan dan pengeluaran
+- Saldo (balance)
+- Breakdown per kategori
+- Daftar transaksi terakhir
+
 ## 🏗️ Arsitektur
 
 ```
@@ -127,7 +154,9 @@ Parkir 2000
 │  WhatsApp   │ ───▶ │  WAHA API    │ ───▶ │  Duwitku    │
 │   User      │      │  (Port 3001) │      │  Bot        │
 └─────────────┘      └──────────────┘      │ (Port 5000) │
-                                            └──────┬──────┘
+                            │               └──────┬──────┘
+                            │                      │
+                            └──── Webhook ─────────┘
                                                    │
                      ┌─────────────────────────────┼────────────────┐
                      ▼                             ▼                ▼
@@ -149,8 +178,9 @@ Parkir 2000
 ### Table: `transactions`
 ```sql
 - id (bigint, primary key)
-- user_id (uuid, foreign key)
-- category_id (bigint, foreign key)
+- user_id (uuid, foreign key → profiles.id)
+- category_id (bigint, foreign key → categories.id)
+- wallet_id (bigint, foreign key → wallets.id, nullable)
 - amount (numeric)
 - type (text: 'income' | 'expense')
 - description (text)
@@ -166,6 +196,15 @@ Parkir 2000
 - type (text: 'income' | 'expense')
 - user_id (uuid, nullable)
 - is_default (boolean)
+```
+
+### Table: `wallets`
+```sql
+- id (bigint, primary key)
+- name (text)
+- user_id (uuid, foreign key)
+- balance (numeric)
+- created_at (timestamp)
 ```
 
 ## 🛠️ Development
@@ -210,14 +249,85 @@ docker-compose restart
 docker-compose restart bot
 ```
 
+## 🌐 API Endpoints
+
+Bot menyediakan beberapa endpoints:
+
+### Health Check
+```bash
+GET http://localhost:5000/health
+```
+Response:
+```json
+{
+  "status": "OK",
+  "timestamp": "2024-12-11T10:30:00.000Z",
+  "service": "duwitku-bot"
+}
+```
+
+### Webhook Endpoint
+```bash
+POST http://localhost:5000/webhook
+```
+Endpoint ini digunakan oleh WAHA untuk mengirim message events. Otomatis terdaftar saat bot startup.
+
+### Root Endpoint
+```bash
+GET http://localhost:5000/
+```
+Response:
+```json
+{
+  "message": "Duwitku Bot is running",
+  "version": "2.1.0"
+}
+```
+
 ## 🔧 Configuration
 
-### Konfigurasi Category ID
+### Performance & Reliability
 
-Edit di `index.js`:
+Bot dioptimasi dengan beberapa mekanisme untuk reliability:
+
+1. **AI Timeout Protection** (10s)
+   - Prevent hanging pada AI calls
+   - Automatic fallback ke kategori default
+   - Error handling & logging
+
+2. **Webhook Auto-Registration**
+   - Retry hingga 5x dengan delay 3s
+   - Resilient terhadap startup race condition
+   - Detailed logging untuk debugging
+
+3. **Environment Validation**
+   - Validasi semua required env vars saat startup
+   - Clear error messages untuk missing configs
+   - Fail-fast untuk mencegah runtime errors
+
+4. **Error Logging**
+   - Detailed logs untuk user lookup
+   - Transaction error tracking
+   - AI response debugging
+
+### Konfigurasi di `index.js`
+
+Semua konfigurasi tersentralisasi dalam objek `CONFIG`:
+
 ```javascript
-const CATEGORY_ID_INCOME = 28;  // ID kategori default income
-const CATEGORY_ID_EXPENSE = 29; // ID kategori default expense
+const CONFIG = {
+  port: parseInt(process.env.PORT) || 5000,
+  wahaUrl: process.env.WAHA_API_URL || 'http://waha:3000',
+  
+  // Default category IDs (fallback when AI fails)
+  defaultCategoryIncome: 28,
+  defaultCategoryExpense: 29,
+  
+  // Performance settings
+  aiTimeoutMs: 10000,              // Timeout untuk AI calls
+  webhookRetryAttempts: 5,         // Retry webhook registration
+  webhookRetryDelayMs: 3000,       // Delay antar retry
+};
 ```
 
 ### Konfigurasi AI Model
@@ -237,42 +347,83 @@ const result = await ai.models.generateContent({
 1. Cek logs: `docker-compose logs -f bot`
 2. Pastikan webhook sudah dikonfigurasi di WAHA
 3. Cek koneksi network antar container
+4. Bot akan otomatis retry webhook registration 5x saat startup
 
-### WhatsApp terputus
-1. Buka WAHA Dashboard
-2. Restart session atau scan ulang QR Code
+### Webhook registration gagal
+1. Pastikan container `bot` sudah running sebelum `waha`
+2. Cek docker-compose.yml: `waha` harus `depends_on: bot`
+3. Lihat logs untuk error detail: `docker-compose logs -f bot waha`
 
-### Database error
-1. Cek credential Supabase di `.env`
-2. Pastikan table sudah dibuat dengan benar
-3. Cek RLS (Row Level Security) policies
+### User tidak ditemukan (getUserId returns null)
+1. Pastikan nomor telepon tersimpan di tabel `profiles`
+2. Format nomor: `62XXXXXXXXXX` (tanpa +, spasi, atau dash)
+3. Cek logs untuk melihat nomor yang dicari vs nomor di database
+4. Test manual query di Supabase:
+   ```sql
+   SELECT * FROM profiles WHERE phone_number = '628XXXXXXXXX';
+   ```
 
-### AI Categorization gagal
-1. Cek Gemini API Key
-2. Cek quota API di Google AI Studio
-3. Bot akan fallback ke kategori default jika AI gagal
+### Transaksi tidak tersimpan
+1. Cek apakah kategori dengan ID tersebut exists
+2. Cek apakah wallet dengan ID/nama tersebut exists
+3. Lihat error di logs untuk detail SQL error
+4. Validasi foreign key constraints di Supabase
 
-## 🔒 Security Notes
+### AI kategorisasi lambat/timeout
+1. Default timeout: 10 detik (konfigurasi di `CONFIG.aiTimeoutMs`)
+2. Jika sering timeout, naikkan nilai timeout
+3. Pastikan API key Gemini valid dan tidak rate-limited
+4. Bot akan fallback ke kategori default jika AI gagal
 
-**JANGAN** commit file berikut ke Git:
-- `.env` - Credential rahasia
-- `docker-compose.yml` - Berisi password
-- `waha-session/` - Session WhatsApp
+## 🚀 Deployment Tips
 
-File-file ini sudah ada di `.gitignore`.
+### Production Checklist
+- [ ] Ganti semua password default di `docker-compose.yml`
+- [ ] Set `WHATSAPP_API_KEY` yang kuat (min 16 karakter)
+- [ ] Gunakan HTTPS jika deploy ke VPS (reverse proxy: nginx/caddy)
+- [ ] Setup backup reguler untuk Supabase database
+- [ ] Monitor logs: `docker-compose logs -f bot --tail=100`
+- [ ] Setup restart policy: `restart: always` (sudah default)
 
-## 📄 License
+### VPS Deployment
+```bash
+# Clone & setup
+git clone <repo-url> && cd duwitku-bot
+cp .env.example .env
+nano .env  # Edit credentials
 
-MIT License - Silakan gunakan untuk project pribadi atau komersial.
+# Setup docker-compose
+cp docker-compose.example.yml docker-compose.yml
+nano docker-compose.yml  # Ganti password
+
+# Deploy
+docker-compose up -d
+
+# Monitor
+docker-compose logs -f
+```
+
+### Resource Requirements
+- **RAM**: Minimum 512MB (recommended 1GB)
+- **Storage**: ~500MB untuk images + session data
+- **CPU**: 1 core (shared OK)
+- **Network**: Stable connection untuk WhatsApp & API calls
 
 ## 🤝 Contributing
 
-Pull requests are welcome! Untuk perubahan besar, silakan buka issue terlebih dahulu.
+Contributions are welcome! Please:
+1. Fork the repository
+2. Create feature branch (`git checkout -b feature/AmazingFeature`)
+3. Commit changes (`git commit -m 'Add some AmazingFeature'`)
+4. Push to branch (`git push origin feature/AmazingFeature`)
+5. Open a Pull Request
 
 ## 📞 Support
 
-Jika ada kendala, silakan buat issue di repository ini.
+- **Email**: fadhil.alifp@gmail.com
+- **WhatsApp**: +6285727304551
+- **GitHub Issues**: [Create an issue](https://github.com/FadhilAlif/duwitku-bot/issues)
 
 ---
 
-**Built with ❤️ for personal finance tracking**
+Built with ❤️ by [Fadhil Alif](https://github.com/FadhilAlif)
