@@ -776,17 +776,28 @@ app.post('/webhook', async (c) => {
     }
 
     const message = payload.payload.body || '';
-    const sender = payload.payload.from;
+    let sender = payload.payload.from;
     chatId = payload.payload.chatId || sender;
 
     console.log(`\n--- 📩 New message from ${sender} ---`);
 
-    // Filter non-personal chats
+    // WORKAROUND: WAHA NOWEB bug - extract real number from _data.key.remoteJidAlt
     if (sender.endsWith('@lid')) {
-      console.log('⚠️ Skipped: WhatsApp Channel (@lid)');
-      return c.text('OK');
+      const realNumber = payload.payload._data?.key?.remoteJidAlt;
+      if (realNumber && !realNumber.endsWith('@lid')) {
+        console.log(`⚠️ WAHA NOWEB Bug detected!`);
+        console.log(`📝 Original sender (LID): ${sender}`);
+        console.log(`📝 Real number found: ${realNumber}`);
+        sender = realNumber;
+        chatId = realNumber;
+      } else {
+        // Real WhatsApp Channel - skip it
+        console.log('⚠️ Skipped: Real WhatsApp Channel (@lid)');
+        return c.text('OK');
+      }
     }
 
+    // Filter group chats
     if (sender.endsWith('@g.us')) {
       console.log('⚠️ Skipped: Group chat (@g.us)');
       return c.text('OK');
