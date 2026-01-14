@@ -258,6 +258,21 @@ const stopTyping = async (chatId) => {
 };
 
 /**
+ * Download media from URL and return as buffer
+ */
+const downloadMedia = async (url) => {
+  try {
+    const response = await fetch(url, { headers: WAHA_HEADERS });
+    if (!response.ok) throw new Error(`Failed to download media: ${response.status}`);
+    const arrayBuffer = await response.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  } catch (error) {
+    console.error('❌ Download media error:', error.message);
+    throw error;
+  }
+};
+
+/**
  * Send WhatsApp message
  */
 const sendMessage = async (chatId, text) => {
@@ -537,6 +552,92 @@ Return ONLY JSON: {"walletId": "<wallet_id>"}`;
   }
 };
 
+/**
+ * Process Image Transaction (Scan Receipt)
+ */
+const processImageTransaction = async (imageBuffer, caption, type = 'application/jpeg') => {
+  const prompt = `Analyze this image. It is a financial receipt or transaction proof.
+Extract the transaction details as a LIST of items.
+For each item found:
+- description: item name
+- amount: price (number only)
+- type: "expense" (default) or "income" (if it's a transfer proof/income)
+
+Return ONLY a JSON array: [{ "description": "...", "amount": 10000, "type": "expense" }]`;
+
+  try {
+    const result = await withTimeout(
+      ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              { inlineData: { mimeType: type, data: imageBuffer.toString('base64') } }
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: 'application/json',
+        },
+      }),
+      CONFIG.aiTimeoutMs,
+      'AI Image Analysis Timeout'
+    );
+
+    const transactions = JSON.parse(result.text);
+    return Array.isArray(transactions) ? transactions : [];
+  } catch (error) {
+    console.error(`❌ AI Image Error: ${error.message}`);
+    return [];
+  }
+};
+
+/**
+ * Process Audio Transaction (Voice Input)
+ */
+const processAudioTransaction = async (audioBuffer, type = 'audio/ogg') => {
+  const prompt = `Listen to this audio. The user is dictating financial transactions in Indonesian.
+Extract the transactions mentioned.
+
+IMPORTANT - Number Handling:
+- Convert "k" or "rb" to thousands (e.g., "15k" -> 15000).
+- Convert "ribu" to 000 (e.g., "50 ribu" -> 50000).
+- Convert "juta" or "jt" to 000000 (e.g., "2 juta" -> 2000000).
+- Handle spoken numbers (e.g., "dua puluh lima ribu" -> 25000).
+
+Return ONLY a JSON array: [{ "description": "...", "amount": 10000, "type": "expense"/"income" }]`;
+
+  try {
+    const result = await withTimeout(
+      ai.models.generateContent({
+        model: 'gemini-2.5-flash',
+        contents: [
+          {
+            role: 'user',
+            parts: [
+              { text: prompt },
+              { inlineData: { mimeType: type, data: audioBuffer.toString('base64') } }
+            ]
+          }
+        ],
+        config: {
+          responseMimeType: 'application/json',
+        },
+      }),
+      CONFIG.aiTimeoutMs,
+      'AI Audio Analysis Timeout'
+    );
+
+    const transactions = JSON.parse(result.text);
+    return Array.isArray(transactions) ? transactions : [];
+  } catch (error) {
+    console.error(`❌ AI Audio Error: ${error.message}`);
+    return [];
+  }
+};
+
 // =============================================================================
 // REPORT FUNCTIONS
 // =============================================================================
@@ -759,6 +860,62 @@ const processTransactions = async (message, userId, userWallets, defaultWallet, 
   return transactions;
 };
 
+/**
+ * Normalize and enrich transactions with categories and wallets
+ */
+const enrichTransactions = async (rawTransactions, userId, userWallets, defaultWallet, categories) => {
+  const transactions = [];
+  const timestamp = getTransactionDate();
+
+  for (const raw of rawTransactions) {
+    const amount = parseFloat(raw.amount);
+    if (!amount || amount <= 0) continue;
+
+    const description = raw.description || 'Unknown';
+    const type = raw.type === 'income' ? 'income' : 'expense';
+    
+    // Get relevant categories
+    const relevantCategories = categories[type] || [];
+
+    // Parallel AI predictions for Category and Wallet (if not specified in raw, usually not)
+    // Note: raw transactions from Image/Audio usually don't have wallet info unless explicitly stated but Gemini might miss it.
+    // For now we re-run prediction or just use default. Let's re-run predictions for accuracy.
+    
+    const [categoryResult, walletResult] = await Promise.allSettled([
+      predictCategory(description, amount, type, relevantCategories),
+      predictWallet(description, amount, type, userWallets),
+    ]);
+
+    // Determine category
+    const category = categoryResult.status === 'fulfilled' && categoryResult.value
+      ? categoryResult.value
+      : { id: type === 'income' ? CONFIG.defaultCategoryIncome : CONFIG.defaultCategoryExpense, name: 'Duwitku Bot' };
+
+    // Determine wallet
+    let wallet = defaultWallet;
+    let walletName = defaultWallet.name;
+
+    if (walletResult.status === 'fulfilled' && walletResult.value) {
+      wallet = walletResult.value;
+      walletName = wallet.name;
+    }
+
+    transactions.push({
+      user_id: userId,
+      category_id: category.id,
+      wallet_id: wallet.id,
+      amount,
+      type,
+      description,
+      transaction_date: timestamp,
+      source_type: 'chat_prompt',
+      _categoryName: category.name,
+      _walletName: walletName,
+    });
+  }
+  return transactions;
+};
+
 // =============================================================================
 // WEBHOOK HANDLER
 // =============================================================================
@@ -776,6 +933,8 @@ app.post('/webhook', async (c) => {
     }
 
     const message = payload.payload.body || '';
+    const hasMedia = payload.payload.hasMedia; // Valid property in WAHA
+    const media = payload.payload.media;
     let sender = payload.payload.from;
     chatId = payload.payload.chatId || sender;
 
@@ -845,13 +1004,35 @@ app.post('/webhook', async (c) => {
     }
 
     // Process transactions
-    const transactions = await processTransactions(
-      message,
-      user.id,
-      userWallets,
-      defaultWallet,
-      { income: incomeCategories, expense: expenseCategories }
-    );
+    // Process transactions
+    let transactions = [];
+
+    if (hasMedia && media) {
+        console.log(`📷 Media detected: ${media.mimetype}`);
+        const buffer = await downloadMedia(media.url);
+        
+        let rawTransactions = [];
+        if (media.mimetype.startsWith('image/')) {
+            await sendMessage(chatId, '🔍 Menganalisa gambar struk...');
+            rawTransactions = await processImageTransaction(buffer, message, media.mimetype);
+        } else if (media.mimetype.startsWith('audio/') || media.mimetype.startsWith('video/ogg')) { // Voice notes often video/ogg in WA
+            await sendMessage(chatId, '🎤 Mendengarkan pesan suara...');
+            rawTransactions = await processAudioTransaction(buffer, media.mimetype);
+        }
+
+        if (rawTransactions.length > 0) {
+            transactions = await enrichTransactions(rawTransactions, user.id, userWallets, defaultWallet, { income: incomeCategories, expense: expenseCategories });
+        }
+    } else {
+        // Text message processing
+        transactions = await processTransactions(
+            message,
+            user.id,
+            userWallets,
+            defaultWallet,
+            { income: incomeCategories, expense: expenseCategories }
+        );
+    }
 
     if (transactions.length > 0) {
       const result = await saveTransactions(transactions);
