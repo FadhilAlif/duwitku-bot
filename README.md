@@ -3,8 +3,10 @@
 Bot WhatsApp cerdas untuk mencatat keuangan pribadi dengan AI-powered categorization. Dibangun dengan [WAHA (WhatsApp HTTP API)](https://waha.devlike.pro/), Hono.js, Supabase, dan Google Gemini AI.
 ## ✨ Fitur
 
+- 📸 **Scan Struk Belanja**: Foto struk, bot otomatis mendeteksi item dan harga
+- 🎤 **Voice Input**: Rekam voice note (misal: "Bensin 20 ribu"), bot mengerti bahasa natural
 - 📝 **Pencatatan Otomatis**: Catat pengeluaran dan pemasukan via WhatsApp
-- 🤖 **AI Kategorisasi**: Gemini AI secara otomatis mengkategorikan transaksi
+- 🤖 **AI Kategorisasi**: Gemini 2.5 Flash secara otomatis mengkategorikan transaksi
 - 💬 **Natural Language**: Ketik seperti chat biasa, bot mengerti
 - 📊 **Multi-Entry**: Catat banyak transaksi sekaligus
 - 📈 **Laporan Harian & Bulanan**: Lihat ringkasan keuangan dengan detail per kategori
@@ -57,9 +59,9 @@ Edit `docker-compose.yml` dan sesuaikan:
 - **WAHA_DASHBOARD_PASSWORD** - Ganti `change-this-password` dengan password kuat
 - **WHATSAPP_SWAGGER_PASSWORD** - Ganti dengan password kuat
 - **WHATSAPP_API_KEY** - Akan otomatis dibaca dari `.env`
+- **WHATSAPP_API_HOSTNAME** - Ganti dengan hostname WAHA
+- **WHATSAPP_API_PORT** - Ganti dengan port WAHA anda
 - Port (jika diperlukan)
-
-> ⚠️ **Note**: Password WAHA sengaja di hardcode di `docker-compose.yml` karena WAHA tidak support env variable untuk credentials. Pastikan ganti password default sebelum deploy production!
 
 ### 4. Jalankan dengan Docker
 
@@ -134,6 +136,20 @@ Makan siang 25000
 Es teh 5000
 Parkir 2000
 ```
+
+### 📸 Fitur Scan Struk (New!)
+Cukup kirimkan foto struk belanjaan Anda ke bot.
+- Bot akan membaca item dan harga secara otomatis.
+- Cocok untuk belanja bulanan atau makan di restoran.
+
+### 🎤 Fitur Voice Input (New!)
+Lagi nyetir atau malas ngetik? Kirim Voice Note (VN):
+> "Isi bensin 50 ribu, terus tadi beli es teh 4k sama mie ayam 15rb."
+
+Bot support format angka Indonesia:
+- "15k" / "15rb" -> 15.000
+- "Setengah juta" -> 500.000
+- "Dua puluh ribu" -> 20.000
 
 ### Lihat Laporan Keuangan
 ```

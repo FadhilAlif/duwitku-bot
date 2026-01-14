@@ -28,6 +28,8 @@ services:
       - WHATSAPP_SWAGGER_PASSWORD=change-this-password
       - WHATSAPP_API_KEY=change-this-api-key
       - WHATSAPP_DEFAULT_ENGINE=NOWEB
+      - WHATSAPP_API_HOSTNAME=waha
+      - WHATSAPP_API_PORT=3000
     ports:
       - "3001:3000"
     volumes:
