@@ -8,7 +8,7 @@ const app = new Hono();
 
 // --- KONFIGURASI ---
 const PORT = 5000;
-const WAHA_API_URL = process.env.WAHA_API_URL || 'http://waha:3000';
+const WAHA_API_URL = process.env.WAHA_API_URL;
 const WAHA_API_KEY = process.env.WHATSAPP_API_KEY;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
