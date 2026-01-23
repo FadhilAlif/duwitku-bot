@@ -1,6 +1,23 @@
 version: '3.0'
 
 services:
+  bot:
+    build: .
+    restart: always
+    environment:
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
+      - WAHA_API_URL=http://waha:3000
+      - WHATSAPP_API_KEY=change-this-api-key
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    ports:
+      - "5000:5000"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:5000/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
   waha:
     image: devlikeapro/waha:latest
     restart: always
@@ -10,24 +27,12 @@ services:
       - WHATSAPP_SWAGGER_USERNAME=admin
       - WHATSAPP_SWAGGER_PASSWORD=change-this-password
       - WHATSAPP_API_KEY=change-this-api-key
-      - WHATSAPP_DEFAULT_ENGINE=WEBJS
-      # - WHATSAPP_WEBHOOK_URL=http://bot:5000/webhook 
-      # - WHATSAPP_WEBHOOK_EVENTS=message 
+      - WHATSAPP_DEFAULT_ENGINE=NOWEB
+      - WHATSAPP_API_HOSTNAME=waha
+      - WHATSAPP_API_PORT=3000
     ports:
       - "3001:3000"
     volumes:
       - ./waha-session:/app/sessions
     depends_on:
       - bot
-
-  bot:
-    build: .
-    restart: always
-    environment:
-      - SUPABASE_URL=${SUPABASE_URL}
-      - SUPABASE_SERVICE_KEY=${SUPABASE_SERVICE_KEY}
-      - WAHA_API_URL=http://waha:3000
-      - WHATSAPP_API_KEY=${WHATSAPP_API_KEY}
-      - GEMINI_API_KEY=${GEMINI_API_KEY}
-    ports:
-      - "5000:5000"
