@@ -10,7 +10,7 @@ const { GoogleGenAI } = require('@google/genai');
 
 const CONFIG = {
   port: parseInt(process.env.PORT) || 5000,
-  wahaUrl: process.env.WAHA_API_URL || 'http://waha:3000',
+  wahaUrl: process.env.WAHA_API_URL,
   wahaApiKey: process.env.WHATSAPP_API_KEY,
   geminiApiKey: process.env.GEMINI_API_KEY,
   supabaseUrl: process.env.SUPABASE_URL,
