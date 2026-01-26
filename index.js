@@ -54,7 +54,7 @@ const WAHA_HEADERS = {
 // =============================================================================
 
 const MESSAGES = {
-  mainMenu: `Halo Mas/Mbak! 👋
+  mainMenu: (userName = 'Mas/Mbak') => `Halo ${userName}! 👋
 Saya *Duwitku BOT*🤖, asisten keuangan pribadi kamu 😊
 
 Pilih opsi yang kamu butuhkan dengan mengetik angka:
@@ -62,8 +62,9 @@ Pilih opsi yang kamu butuhkan dengan mengetik angka:
 1️⃣ Cara Mencatat di Duwitku
 2️⃣ Laporan Keuangan Hari Ini
 3️⃣ Laporan Keuangan Bulan Ini
-4️⃣ Download Aplikasi Duwitku
+4️⃣ Total Aset & Dompet
 5️⃣ Lapor Kendala
+6️⃣ Download Aplikasi Duwitku
 
 ✨ *Tips:*
 - Ketik angkanya saja. Contoh: *1* untuk "Cara Mencatat".`,
@@ -273,6 +274,32 @@ const downloadMedia = async (url) => {
 };
 
 /**
+ * Get contact name from WAHA
+ */
+const getContactName = async (chatId) => {
+  try {
+    const response = await fetch(`${CONFIG.wahaUrl}/api/contacts/${chatId}?session=default`, {
+      method: 'GET',
+      headers: WAHA_HEADERS,
+    });
+    
+    if (!response.ok) {
+      console.warn(`⚠️ Failed to get contact info: ${response.status}`);
+      return null;
+    }
+    
+    const contact = await response.json();
+    // Try to get name in order: pushname, name, or phone number
+    const name = contact.pushname || contact.name || contact.number;
+    console.log(`👤 Contact name: ${name}`);
+    return name;
+  } catch (error) {
+    console.warn(`⚠️ Get contact name error: ${error.message}`);
+    return null;
+  }
+};
+
+/**
  * Send WhatsApp message
  */
 const sendMessage = async (chatId, text) => {
@@ -320,6 +347,20 @@ const getUserWallets = async (userId) => {
     .from('wallets')
     .select('id, name, type')
     .eq('user_id', userId);
+  
+  return data || [];
+};
+
+/**
+ * Get user's wallets with balance (for assets report)
+ */
+const getUserWalletsWithBalance = async (userId) => {
+  const { data } = await supabase
+    .from('wallets')
+    .select('id, name, type, initial_balance, is_active')
+    .eq('user_id', userId)
+    .eq('is_active', true)
+    .order('created_at', { ascending: true });
   
   return data || [];
 };
@@ -663,6 +704,42 @@ const getMonthlyReport = async (userId) => {
 };
 
 /**
+ * Format assets and wallets message
+ */
+const formatAssetsReport = (wallets) => {
+  if (!wallets?.length) {
+    return `💰 *Total Aset & Dompet*\n\n` +
+           `Belum ada dompet.\n\n` +
+           `💡 Buat dompet di aplikasi Duwitku untuk mulai mengelola keuangan.`;
+  }
+
+  const totalAssets = wallets.reduce((sum, w) => sum + (parseFloat(w.initial_balance) || 0), 0);
+  
+  let msg = `💰 *Total Aset & Dompet*\n\n`;
+  msg += `💵 *Total Aset:* Rp ${formatRupiah(totalAssets)}\n`;
+  msg += `🏦 *Jumlah Dompet:* ${wallets.length}\n\n`;
+  msg += `📋 *Rincian Dompet:*\n`;
+
+  wallets.forEach(w => {
+    const balance = parseFloat(w.initial_balance) || 0;
+    const icon = w.type === 'cash' ? '💵' : 
+                 w.type === 'bank' ? '🏦' : 
+                 w.type === 'e_wallet' ? '📱' : 
+                 w.type === 'investment' ? '📈' : '💼';
+    const typeLabel = w.type === 'cash' ? 'Tunai' :
+                      w.type === 'bank' ? 'Bank' :
+                      w.type === 'e_wallet' ? 'E-Wallet' :
+                      w.type === 'investment' ? 'Investasi' : 'Lainnya';
+    
+    msg += `${icon} *${w.name}* (${typeLabel})\n`;
+    msg += `   Saldo: Rp ${formatRupiah(balance)}\n`;
+  });
+
+  msg += `\n💡 *Tips:* Update saldo dompet di aplikasi Duwitku untuk data yang lebih akurat.`;
+  return msg;
+};
+
+/**
  * Format report message
  */
 const formatReport = (transactions, period) => {
@@ -740,12 +817,12 @@ const formatReport = (transactions, period) => {
 // MESSAGE HANDLERS
 // =============================================================================
 
-const TRANSACTION_REGEX = /^(.*?)[\s]+(\d+(?:[.,]\d+)*(?:k|rb|jt|juta)?)(?:[\s]+([a-zA-Z0-9\s]+))?$/i;
+const TRANSACTION_REGEX = /^(.*?)[\s]+(?:Rp\.?|IDR\.?)?[\s]*(\d+(?:[.,]\d+)*(?:k|rb|jt|juta)?)(?:[\s]+([a-zA-Z0-9\s]+))?$/i;
 
 /**
  * Handle menu commands
  */
-const handleMenuCommand = async (command, userId, chatId) => {
+const handleMenuCommand = async (command, userId, chatId, userName) => {
   switch (command) {
     case '1':
       await sendMessage(chatId, MESSAGES.help);
@@ -771,12 +848,20 @@ const handleMenuCommand = async (command, userId, chatId) => {
       return true;
     }
 
-    case '4':
-      await sendMessage(chatId, MESSAGES.download);
+    case '4': {
+      console.log('💰 Generating assets report...');
+      const wallets = await getUserWalletsWithBalance(userId);
+      await sendMessage(chatId, formatAssetsReport(wallets));
+      console.log(`✅ Assets report sent (${wallets.length} wallets)`);
       return true;
+    }
 
     case '5':
       await sendMessage(chatId, MESSAGES.reportIssue);
+      return true;
+
+    case '6':
+      await sendMessage(chatId, MESSAGES.download);
       return true;
 
     default:
@@ -938,15 +1023,10 @@ app.post('/webhook', async (c) => {
     let sender = payload.payload.from;
     chatId = payload.payload.chatId || sender;
 
-    console.log(`\n--- 📩 New message from ${sender} ---`);
-
-    // WORKAROUND: WAHA NOWEB bug - extract real number from _data.key.remoteJidAlt
+    // WORKAROUND: WAHA NOWEB - extract real number from _data.key.remoteJidAlt
     if (sender.endsWith('@lid')) {
       const realNumber = payload.payload._data?.key?.remoteJidAlt;
       if (realNumber && !realNumber.endsWith('@lid')) {
-        console.log(`⚠️ WAHA NOWEB Bug detected!`);
-        console.log(`📝 Original sender (LID): ${sender}`);
-        console.log(`📝 Real number found: ${realNumber}`);
         sender = realNumber;
         chatId = realNumber;
       } else {
@@ -955,6 +1035,8 @@ app.post('/webhook', async (c) => {
         return c.text('OK');
       }
     }
+
+    console.log(`\n--- 📩 New message from ${sender} ---`);
 
     // Filter group chats
     if (sender.endsWith('@g.us')) {
@@ -978,12 +1060,17 @@ app.post('/webhook', async (c) => {
     }
 
     console.log(`✅ User found: ${user.id}`);
+    
+    // Get contact name from WAHA
+    const contactName = await getContactName(chatId);
+    const userName = contactName || 'Mas/Mbak';
+    
     await startTyping(chatId);
 
     const cleanMsg = message.trim();
 
     // Handle menu commands
-    if (await handleMenuCommand(cleanMsg, user.id, chatId)) {
+    if (await handleMenuCommand(cleanMsg, user.id, chatId, userName)) {
       await stopTyping(chatId);
       console.log(`⏱️ Execution time: ${Date.now() - startTime}ms`);
       return c.text('OK');
@@ -1051,7 +1138,7 @@ app.post('/webhook', async (c) => {
       }
     } else {
       await stopTyping(chatId);
-      await sendMessage(chatId, MESSAGES.mainMenu);
+      await sendMessage(chatId, MESSAGES.mainMenu(userName));
     }
 
     console.log(`⏱️ Execution time: ${Date.now() - startTime}ms`);
@@ -1073,7 +1160,7 @@ app.get('/health', (c) => c.json({ status: 'ok', timestamp: new Date().toISOStri
 // =============================================================================
 
 const startServer = async () => {
-  console.log('🤖 Duwitku Bot v2.1 starting...');
+  console.log('🤖 Duwitku Bot starting...');
   console.log(`⚡ Performance: AI timeout ${CONFIG.aiTimeoutMs}ms`);
   
   // Start HTTP server
